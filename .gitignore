@@ -23,3 +23,6 @@ dist/
 .env.*
 *.pem
 *.key
+
+# Local implementation scratch files and backups
+work/

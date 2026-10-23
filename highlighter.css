@@ -1,0 +1,101 @@
+.reader-tools { position:static; flex:0 0 auto; display:flex; flex-wrap:nowrap; align-items:center; justify-content:flex-start; gap:6px; width:100%; overflow-x:auto; overflow-y:hidden; box-sizing:border-box; padding:6px 10px; border-top:1px solid var(--border); background:var(--surface); }
+.reader-type, .reader-palette { display:flex; align-items:center; flex:0 0 auto; gap:4px; padding:4px; border-radius:8px; background:#25292e; box-shadow:0 3px 16px #0002; }
+.reader-tools button { border:1px solid #646970; background:transparent; color:#fff; border-radius:7px; min-height:30px; padding:3px 7px; font:12px var(--font-body); cursor:pointer; }
+.reader-tools button:hover { border-color:#fff; }
+.reader-tools button:focus-visible { outline:3px solid #6394e9; outline-offset:3px; }
+.reader-tools .reader-color { background:var(--swatch); color:#343434; width:28px; padding:3px; font-weight:600; border:2px solid transparent; }
+.reader-tools button[aria-pressed="true"] { outline:2px solid white; outline-offset:2px; }
+#readerStatus { color:#666; background:#fffffff2; padding:3px 8px; border-radius:6px; font-size:12px; }
+::highlight(reader-0) { background-color:#ffb3a7; color:#292929; }
+::highlight(reader-1) { background-color:#fff59a; color:#292929; }
+::highlight(reader-2) { background-color:#a7e8c9; color:#292929; }
+::highlight(reader-3) { background-color:#f5b9d4; color:#292929; }
+::highlight(reader-4) { background-color:#c9b9f4; color:#292929; }
+
+.reader-palette[hidden] { display:none; }
+body:not(.full-reader) #readerWidth { display:none; }
+body:not(.full-reader) .reader-palette { flex-wrap:nowrap; }
+body:not(.full-reader) .reader-tools { right:12px; bottom:12px; }
+body:not(.full-reader) #readerStatus { font-size:11px; }
+body .content { min-height:0; padding-bottom:20px; }
+body { overflow-y:hidden; }
+@media(max-width:700px) {
+  .reader-tools { right:12px; bottom:12px; }
+  .reader-palette { flex-wrap:nowrap; }
+  .reader-tools button { padding:4px 7px; }
+  #readerStatus { font-size:11px; }
+}
+
+#readerFontSize { min-width:32px; text-align:center; color:#fff; font:13px var(--font-body); }
+/* Apply size changes to every transcript language and timestamp layout. */
+body:not(.full-reader) #transcriptList,
+body:not(.full-reader) #transcriptList .transcript-text,
+body:not(.full-reader) #transcriptList .transcript-original,
+body:not(.full-reader) #transcriptList .transcript-translation {
+  font-size:var(--reader-size, 16px);
+}
+
+/* Keep the continuous-highlighting switch beneath language and Settings. */
+.header-actions { display:grid; grid-template-columns:auto auto; }
+.continuous-highlight-btn {
+  grid-column:1 / -1; justify-self:end; display:inline-flex; align-items:center; gap:6px;
+  padding:7px 14px; border:1px solid var(--border); border-radius:var(--r-pill);
+  background:var(--surface); color:var(--text-secondary);
+  font:600 12px/1.4 var(--font-body); cursor:pointer;
+}
+.continuous-highlight-btn:hover { border-color:var(--accent); color:var(--accent); }
+.continuous-highlight-btn[aria-pressed="true"] {
+  background:var(--accent); border-color:var(--accent); color:white;
+}
+.continuous-highlight-btn:focus-visible { outline:3px solid #6394e9; outline-offset:3px; }
+
+.reading-toggle-actions { grid-column:1 / -1; display:flex; justify-content:flex-end; flex-wrap:wrap; gap:6px; }
+.auto-scroll-toggle {
+  padding:7px 14px; border:1px solid var(--border); border-radius:var(--r-pill);
+  background:var(--surface); color:var(--text-secondary);
+  font:600 12px/1.4 var(--font-body); cursor:pointer;
+}
+.auto-scroll-toggle:hover { border-color:var(--accent); color:var(--accent); }
+.auto-scroll-toggle[aria-pressed="true"] { background:var(--accent); border-color:var(--accent); color:white; }
+.auto-scroll-toggle:focus-visible { outline:3px solid #6394e9; outline-offset:3px; }
+
+.reader-tools #readerStatus { flex:0 0 auto; max-width:64px; padding:0 2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left; }
+.reader-tools .follow-playback-btn { flex:0 0 auto; white-space:nowrap; position:static; transform:none; margin:0; box-shadow:none; background:var(--accent); color:#fff; }
+
+.reader-tools button { flex-shrink:0; white-space:nowrap; }
+
+
+/* Compact controls preserve vertical space for the transcript. */
+.header { padding:8px 12px 0; }
+.header-top { flex-wrap:wrap; gap:4px 8px; }
+.header-top .video-info { flex:1 1 100%; }
+.header-top .header-actions { display:flex; flex:1 1 100%; min-width:0; align-items:center; flex-wrap:wrap; gap:4px; }
+.header-actions .global-language-control { margin:0; }
+.reading-toggle-actions { display:contents; }
+.highlight-export-pair { display:inline-flex; align-items:center; gap:4px; flex-wrap:nowrap; }
+.header-actions button { min-height:27px; padding:4px 8px; font-size:11px; line-height:1.4; white-space:nowrap; }
+.header-actions .continuous-highlight-btn { gap:4px; }
+.header-actions .continuous-highlight-btn svg { width:12px; height:12px; }
+.highlight-export-btn {
+  display:inline-flex; align-items:center; justify-content:center; gap:4px;
+  border:1px solid #1d4ed8; border-radius:var(--r-pill);
+  background:#2563eb; color:#fff; font:700 11px/1.4 var(--font-body); cursor:pointer;
+}
+.highlight-export-btn:hover { background:#1d4ed8; }
+.highlight-export-btn:focus-visible { outline:3px solid #60a5fa; outline-offset:2px; }
+.highlight-export-btn:disabled { opacity:.65; cursor:wait; }
+#openReaderBtn { background:var(--accent-dim); color:var(--accent); font-weight:700; }
+#openReaderBtn:disabled { opacity:1; cursor:default; }
+.header .tabs { margin-top:5px; padding-bottom:5px; gap:3px; }
+.header .tab { padding:5px 2px; font-size:12px; }
+.content { padding-top:10px; }
+.section { padding:12px; }
+.transcript-section-header { margin-bottom:7px; flex-wrap:wrap; gap:5px; }
+.transcript-actions { gap:4px; flex-wrap:wrap; }
+.transcript-actions .enhance-btn { padding:4px 8px; font-size:11px; }
+.transcript-search { min-height:30px; margin-bottom:6px; }
+/* Let small toggles share the first row before the Reader/highlight/export group. */
+.highlight-export-pair { order:1; }
+.header .video-title { -webkit-line-clamp:1; font-size:12px; margin-bottom:1px; }
+.header .video-channel { font-size:10px; line-height:1.2; }
+.header-actions .global-language-control { padding:2px; }

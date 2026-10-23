@@ -45,6 +45,26 @@
 
       <form id="settingsForm">
         <section class="card">
+          <h2 data-i18n="readingDefaults">Reading defaults</h2>
+          <label for="defaultTranscriptMode" data-i18n="defaultTranscriptModeLabel">Default side-panel language</label>
+          <select id="defaultTranscriptMode" name="defaultTranscriptMode">
+            <option value="original" data-i18n="modeOriginal">Original</option>
+            <option value="zh" data-i18n="modeChinese">Chinese only</option>
+            <option value="bilingual" data-i18n="modeBilingual" selected>Original + Chinese</option>
+          </select>
+          <label for="defaultReaderMode" data-i18n="defaultReaderModeLabel">Default Reader language</label>
+          <select id="defaultReaderMode" name="defaultReaderMode">
+            <option value="original" data-i18n="modeOriginal" selected>Original</option>
+            <option value="zh" data-i18n="modeChinese">Chinese only</option>
+            <option value="bilingual" data-i18n="modeBilingual">Original + Chinese</option>
+          </select>
+          <p class="help" data-i18n="readingDefaultsHelp">Used when opening a video or Reader. You can still switch languages while reading. Chinese translation uses your AI key.</p>
+          <div class="form-actions">
+            <button id="saveReadingDefaultsBtn" type="button" data-i18n="saveReadingDefaults">Save reading defaults</button>
+            <span id="readingDefaultsStatus" role="status" aria-live="polite"></span>
+          </div>
+        </section>
+        <section class="card">
           <h2 data-i18n="transcriptProvider">Transcript provider</h2>
           <label for="supadataApiKey" data-i18n="supadataApiKeyLabel"
             >Supadata API key</label

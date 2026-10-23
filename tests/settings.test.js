@@ -61,3 +61,19 @@ test("Supadata receives a canonical YouTube URL", () => {
     /Invalid YouTube video ID/,
   );
 });
+
+
+test("display defaults validate independently and survive legacy settings migration", () => {
+  assert.equal(settings.normalize().defaultTranscriptMode, "bilingual");
+  assert.equal(settings.normalize().defaultReaderMode, "original");
+  for (const mode of ["original", "zh", "bilingual"]) {
+    const normalized = settings.normalize({ defaultTranscriptMode: mode, defaultReaderMode: mode });
+    assert.equal(normalized.defaultTranscriptMode, mode);
+    assert.equal(normalized.defaultReaderMode, mode);
+  }
+  const migrated = settings.migrateLegacyCustom({ provider: "custom", defaultTranscriptMode: "zh", defaultReaderMode: "bilingual" }).settings;
+  assert.equal(migrated.defaultTranscriptMode, "zh");
+  assert.equal(migrated.defaultReaderMode, "bilingual");
+  assert.equal(settings.normalize({defaultTranscriptMode:"invalid", defaultReaderMode:null}).defaultTranscriptMode,"bilingual");
+  assert.equal(settings.normalize({defaultTranscriptMode:"invalid", defaultReaderMode:null}).defaultReaderMode,"original");
+});

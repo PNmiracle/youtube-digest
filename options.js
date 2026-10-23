@@ -10,6 +10,14 @@ const YTD_OPTIONS = (() => {
       heading: "Bring your own API keys",
       lede:
         "Keys stay in this Chrome profile and are sent only to Supadata and DeepSeek. This open-source extension has no developer server or analytics.",
+      readingDefaults: "Reading defaults",
+      defaultTranscriptModeLabel: "Default side-panel language",
+      defaultReaderModeLabel: "Default Reader language",
+      modeOriginal: "Original",
+      modeChinese: "Chinese only",
+      modeBilingual: "Original + Chinese",
+      readingDefaultsHelp: "Used when opening a video or Reader. You can still switch languages while reading. Chinese translation uses your AI key.",
+      saveReadingDefaults: "Save reading defaults",
       transcriptProvider: "Transcript provider",
       supadataApiKeyLabel: "Supadata API key",
       supadataHelp: "Used to fetch timestamped YouTube subtitles. ",
@@ -80,6 +88,14 @@ const YTD_OPTIONS = (() => {
       heading: "使用你自己的 API 密钥",
       lede:
         "密钥仅保存在当前 Chrome 个人资料中，只会发送给 Supadata 和 DeepSeek。本开源扩展没有开发者服务器，也不使用分析服务。",
+      readingDefaults: "默认阅读设置",
+      defaultTranscriptModeLabel: "侧边栏默认语言",
+      defaultReaderModeLabel: "整页 Reader 默认语言",
+      modeOriginal: "原文",
+      modeChinese: "仅中文",
+      modeBilingual: "原文 + 中文（双语）",
+      readingDefaultsHelp: "打开视频或 Reader 时使用。阅读过程中仍可随时切换语言。中文翻译需要 AI 密钥。",
+      saveReadingDefaults: "保存阅读设置",
       transcriptProvider: "字幕服务",
       supadataApiKeyLabel: "Supadata API 密钥",
       supadataHelp: "用于获取带时间戳的 YouTube 字幕。",
@@ -350,6 +366,9 @@ const YTD_OPTIONS = (() => {
     const form = doc.getElementById("settingsForm");
     const aiApiKeyInput = doc.getElementById("aiApiKey");
     const supadataApiKeyInput = doc.getElementById("supadataApiKey");
+    const defaultTranscriptMode = doc.getElementById("defaultTranscriptMode");
+    const defaultReaderMode = doc.getElementById("defaultReaderMode");
+    const readingDefaultsStatus = doc.getElementById("readingDefaultsStatus");
     const customizationPrompt = doc.getElementById("customizationPrompt");
     const copyCustomizationPromptBtn = doc.getElementById(
       "copyCustomizationPromptBtn",
@@ -422,6 +441,8 @@ const YTD_OPTIONS = (() => {
 
         aiApiKeyInput.value = settings.aiApiKey;
         supadataApiKeyInput.value = settings.supadataApiKey;
+        defaultTranscriptMode.value = settings.defaultTranscriptMode;
+        defaultReaderMode.value = settings.defaultReaderMode;
         if (migration.migrated) {
           await storage.set({ [settingsApi.STORAGE_KEY]: settings });
           setStatus(saveStatus, "migrationWarning");
@@ -447,6 +468,8 @@ const YTD_OPTIONS = (() => {
       const settings = settingsApi.normalize({
         aiApiKey: aiApiKeyInput.value,
         supadataApiKey: supadataApiKeyInput.value,
+        defaultTranscriptMode: defaultTranscriptMode.value,
+        defaultReaderMode: defaultReaderMode.value,
       });
 
       if (!settings.supadataApiKey) {
@@ -503,6 +526,20 @@ const YTD_OPTIONS = (() => {
       setStatus(dataStatus, "allDataDeleted");
     }
 
+    // Reading preferences can be saved independently of API key setup.
+    doc.getElementById("saveReadingDefaultsBtn").addEventListener("click", async () => {
+      setStatus(readingDefaultsStatus, "saving");
+      try {
+        const stored = await storage.get(settingsApi.STORAGE_KEY);
+        const settings = settingsApi.normalize({
+          ...stored[settingsApi.STORAGE_KEY],
+          defaultTranscriptMode: defaultTranscriptMode.value,
+          defaultReaderMode: defaultReaderMode.value,
+        });
+        await storage.set({ [settingsApi.STORAGE_KEY]: settings });
+        setStatus(readingDefaultsStatus, "saved");
+      } catch (_error) { setStatus(readingDefaultsStatus, "saveFailed"); }
+    });
     form.addEventListener("submit", saveSettings);
     copyCustomizationPromptBtn.addEventListener(
       "click",

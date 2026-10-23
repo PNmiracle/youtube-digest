@@ -8,39 +8,37 @@ const source = fs.readFileSync(
   "utf8",
 );
 
-test("all timestamped transcript row clicks use the selection-aware seek helper", () => {
-  assert.match(
-    source,
-    /function hasNonCollapsedTextSelection\(\)[\s\S]*?selection\.rangeCount > 0 && !selection\.isCollapsed/,
-  );
-  assert.match(
-    source,
-    /function seekFromTranscriptEntryClick\(event, seconds\)[\s\S]*?if \(hasNonCollapsedTextSelection\(\)\) \{[\s\S]*?event\.preventDefault\(\);[\s\S]*?event\.stopPropagation\(\);[\s\S]*?return;[\s\S]*?\}[\s\S]*?seekTo\(seconds\);/,
-  );
+test("replay button and right-click seek without using ordinary transcript clicks", () => {
+  assert.doesNotMatch(source, /seekFromTranscriptEntryClick/);
+  assert.match(source, /setupTranscriptReplay\(div, group\.start\)/);
+  assert.match(source, /setupTranscriptReplay\(div, segment\.start\)/);
+  const vm=require('node:vm');
+  const helper=source.slice(source.indexOf('function setupTranscriptReplay('),source.indexOf('function transcriptWordBounds('));
+  let clicked, rightClicked, sought, cleared;
+  const context={currentTranscriptSource:"youtube-player",seekTo:seconds=>{sought=seconds;},dismissSelectionActions:flag=>{cleared=flag;}};
+  vm.createContext(context);vm.runInContext(helper,context);
+  context.setupTranscriptReplay({addEventListener:(name, fn)=>{assert.equal(name,"contextmenu");rightClicked=fn;},querySelector:selector=>{
+    assert.equal(selector,'.transcript-replay-btn');
+    return {addEventListener:(name,fn)=>{assert.equal(name,'click');clicked=fn;}};
+  }},48.25);
+  assert.equal(sought,undefined);
+  clicked({preventDefault(){},stopPropagation(){}});
+  assert.equal(sought,48.25);assert.equal(cleared,true);
+  sought=undefined;cleared=false;
+  let prevented=false,stopped=false;
+  rightClicked({preventDefault(){prevented=true;},stopPropagation(){stopped=true;}});
+  assert.equal(sought,48.25);assert.equal(cleared,true);
+  assert.equal(prevented,true);assert.equal(stopped,true);
+  sought=undefined;context.currentTranscriptSource="academy-lesson-text";
+  rightClicked({preventDefault(){throw new Error("Written lessons retain their context menu");}});
+  assert.equal(sought,undefined);
 
-  const guardedRowHandlers = source.match(
-    /div\.addEventListener\("click", \(event\) =>\s+seekFromTranscriptEntryClick\(event, group\.start\),\s+\);/g,
-  );
-  assert.equal(
-    guardedRowHandlers?.length,
-    1,
-    "raw transcript rows must use the guard",
-  );
-  assert.match(
-    source,
-    /div\.addEventListener\("click", \(event\) =>\s+seekFromTranscriptEntryClick\(event, segment\.start\),\s+\);/,
-    "translated-only and bilingual rows must use the guard",
-  );
-  assert.doesNotMatch(
-    source,
-    /div\.addEventListener\("click", \(\) => seekTo\(group\.start\)\);/,
-  );
 });
 
 test("the selection toolbar preserves selection and contains pointer events", () => {
   assert.match(
     source,
-    /class="explain-btn"[\s\S]*?>Explain<[\s\S]*class="selection-note-btn"[\s\S]*?>Note</,
+    /class="explain-btn"[\s\S]*?>Explain<[\s\S]*class="selection-note-btn"[\s\S]*?>Highlight</,
   );
   assert.match(
     source,
@@ -56,7 +54,7 @@ test("the selection toolbar preserves selection and contains pointer events", ()
   );
   assert.match(
     source,
-    /querySelector\("\.selection-note-btn"\)[\s\S]*action: "saveNote"[\s\S]*timestamp: selectedTimestamp[\s\S]*selectedText/,
+    /querySelector\("\.selection-note-btn"\)[\s\S]*ytd_manual_highlights:[\s\S]*chrome\.storage\.local\.set/,
   );
   assert.match(
     source,
@@ -87,14 +85,14 @@ test("Notes opens at its newest item and Transcript keeps its position", () => {
   );
 });
 
-test("the transcript view restores without resuming automatic scrolling", () => {
+test("opening a video follows playback instead of restoring a paused reading position", () => {
   assert.match(
     source,
     /void saveCurrentTranscriptViewState\(\);\s+window\.close\(\);/,
   );
   assert.match(
     source,
-    /pendingTranscriptViewState = await loadTranscriptViewState\(videoId\)/,
+    /pendingTranscriptViewState = null;[\s\S]*currentTranscriptMode = await loadDisplayLanguageMode\(videoId\);[\s\S]*switchTab\("transcript"\)/,
   );
   assert.match(
     source,
@@ -102,7 +100,7 @@ test("the transcript view restores without resuming automatic scrolling", () => 
   );
   assert.match(
     source,
-    /willRestoreReadingPosition[\s\S]*autoScrollEnabled = !willRestoreReadingPosition/,
+    /willRestoreReadingPosition[\s\S]*autoScrollEnabled = autoScrollEnabled && !willRestoreReadingPosition/,
   );
   assert.match(
     source,
@@ -128,11 +126,11 @@ test("the first non-YouTube navigation is checked again after commit", () => {
 test("the panel never borrows a background YouTube tab", () => {
   assert.match(
     source,
-    /const tabs = await chrome\.tabs\.query\(\{\s*active: true,\s*lastFocusedWindow: true,\s*\}\);/,
+    /const tabs = window\.digestReader[\s\S]*?resolveSourceTab\(\)[\s\S]*?: await chrome\.tabs\.query\(\{ active: true, windowId \}\);/,
   );
   assert.match(
     source,
-    /if \(!tab\.url\.startsWith\("https:\/\/www\.youtube\.com"\)\) \{\s*handleFrontTabUrl\(tab\.url\);\s*return;/,
+    /if \(!tab\.url\.startsWith\("https:\/\/www\.youtube\.com"\) && !extractVideoId\(tab\.url\)\?\.startsWith\("academy:"\) && !extractVideoId\(tab\.url\)\?\.startsWith\("descript:"\)\) \{\s*handleFrontTabUrl\(tab\.url\);\s*return;/,
   );
   assert.doesNotMatch(
     source,

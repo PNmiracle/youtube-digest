@@ -21,6 +21,9 @@ let currentTranscript = null;
 let currentTranscriptText = null; // Plain text (for display/export)
 let currentTranscriptTimestamped = null; // With timestamps for AI analysis
 let currentTranscriptLanguage = null;
+let currentTranscriptSourceKey = null;
+let currentTranscriptSource = null;
+let refreshTranscriptInProgress = false;
 let currentVideoTitle = "";
 let currentChannelName = "";
 let currentVideoDescription = "";
@@ -28,13 +31,17 @@ let currentVideoDuration = 0;
 let isAnalysisLoading = false; // Track if analysis is in progress
 let youtubeTabId = null; // Store the YouTube tab ID for reliable messaging
 let errorAction = null;
+let sidePanelLifecyclePort = null;
+let tabCheckGeneration = 0;
+let digestGeneration = 0;
+let digestRequestGeneration = 0;
 
 // --- Translation state ---
 // The universal language control supports original content, Chinese, and an
 // aligned bilingual view across Transcript, Overview, and Notes.
-let currentTranscriptMode = "original";
-const DISPLAY_LANGUAGE_MODE_KEY = "ytd_display_language_modes_by_video";
+let currentTranscriptMode = "bilingual";
 const DISPLAY_LANGUAGE_MODES = new Set(["original", "zh", "bilingual"]);
+const TRANSCRIPT_CACHE_VERSION = 3;
 let translationGeneration = 0; // Invalidates responses from older UI modes/videos.
 let translationWorkCount = 0;
 let transcriptScrollObserver = null;
@@ -53,6 +60,19 @@ const TRANSLATION_BATCH_SIZE = 3;
 // Search navigation only scrolls the panel. It does not seek the video.
 let transcriptSearchMatches = [];
 let transcriptSearchIndex = -1;
+
+// --- Vocabulary state ---
+// Entries live in chrome.storage.local and apply across every video.
+let currentVocabulary = [];
+let vocabularyNotebook = "all";
+let vocabularyScope = "video";
+let vocabularyAutoEnabled = true;
+let vocabularyReviewId = null;
+let vocabularyReviewKey = "";
+const vocabularyPanelJobs = new Set();
+let vocabularyLastAttempt = "";
+let vocabularyLearningTimer = null;
+
 
 /**
  * Prevent a stopped service worker or dead message channel from leaving the
@@ -95,7 +115,8 @@ function sendTranslationMessage(message) {
 }
 
 // --- Auto-scroll state (follow video playback in transcript) ---
-let autoScrollEnabled = true; // True = scroll transcript to follow video playback
+let autoScrollLocked = true; // Explicit toggle keeps following after manual scrolling.
+let autoScrollEnabled = true; // Follow by default; the toggle can disable it.
 let autoScrollInterval = null; // setInterval ID for polling video time
 let lastAutoScrollTime = 0; // Timestamp of last programmatic scroll (ignores scroll events within 1s)
 
@@ -106,6 +127,7 @@ let pendingTranscriptViewState = null;
 let transcriptViewStateSaveTimer = null;
 let isRestoringTranscriptView = false;
 let selectionActionsController = null;
+let transcriptTimestampsVisible = false;
 let lastTranscriptScrollTop = 0;
 
 // ============================================================
@@ -113,10 +135,10 @@ let lastTranscriptScrollTop = 0;
 // ============================================================
 
 const TRANSCRIPT_SEGMENT_LIMITS = Object.freeze({
-  minChars: 60,
-  idealChars: 180,
-  maxChars: 320,
-  maxSeconds: 20,
+  minChars: 30,
+  idealChars: 100,
+  maxChars: 160,
+  maxSeconds: 8,
 });
 
 function normalizeCaptionText(text) {
@@ -137,7 +159,7 @@ function splitOversizedThought(text, maxChars) {
   let rest = normalizeCaptionText(text);
 
   while (rest.length > maxChars) {
-    const windowText = rest.slice(0, maxChars + 1);
+    const windowText = rest.slice(0, maxChars);
     const lowerBound = Math.floor(maxChars * 0.55);
     let cut = -1;
 
@@ -162,12 +184,15 @@ function splitOversizedThought(text, maxChars) {
 /**
  * Reconstructs complete sentences across raw caption boundaries. Each segment
  * keeps the timestamp of the first caption that contributed text. Character
- * and time limits prevent a malformed Supadata entry from becoming one giant
- * row while punctuation remains the preferred boundary.
+ * and time limits apply only when captions have no sentence punctuation.
+ * Complete sentences are never split merely to meet a size or time target.
  */
 function groupTranscriptEntries(entries, limits = TRANSCRIPT_SEGMENT_LIMITS) {
   if (!Array.isArray(entries) || entries.length === 0) return [];
 
+  const hasSentenceBoundaries = entries.some(entry =>
+    /[.!?。！？]["')\]”’）】」』]*(?:\s|$)/.test(normalizeCaptionText(entry?.text)),
+  );
   const pieces = [];
   entries.forEach((entry, entryIndex) => {
     const text = normalizeCaptionText(entry?.text);
@@ -177,24 +202,32 @@ function groupTranscriptEntries(entries, limits = TRANSCRIPT_SEGMENT_LIMITS) {
     const sentenceParts =
       text.match(/[^.!?;:,。！？；：，]+(?:[.!?;:,。！？；：，]+["')\]”’）】」』]*|$)/g) ||
       [text];
+    // Also split long provider entries by time, even without punctuation.
+    const pieceMaxChars = duration > limits.maxSeconds
+      ? Math.max(1, Math.min(limits.maxChars,
+          Math.floor(text.length * limits.maxSeconds / duration)))
+      : limits.maxChars;
     let consumedChars = 0;
 
     sentenceParts.forEach((sentencePart) => {
       const cleanPart = normalizeCaptionText(sentencePart);
       if (!cleanPart) return;
-      const oversizedParts = splitOversizedThought(cleanPart, limits.maxChars);
+      const oversizedParts = hasSentenceBoundaries ? [cleanPart] : splitOversizedThought(cleanPart, pieceMaxChars);
       oversizedParts.forEach((part, partIndex) => {
-        const ratio = text.length ? Math.min(1, consumedChars / text.length) : 0;
+        const offset = text.indexOf(part, consumedChars);
+        const partStart = offset >= 0 ? offset : consumedChars;
+        const ratio = text.length ? Math.min(1, partStart / text.length) : 0;
         pieces.push({
           text: part,
           start: start + duration * ratio,
+          end: start + duration * Math.min(1, (partStart + part.length) / text.length),
           semanticEnd:
             /[.!?。！？]["')\]”’）】」』]*$/.test(part) ||
             oversizedParts.length > 1,
           clauseEnd: /[;:,；：，]["')\]”’）】」』]*$/.test(part),
           sourceOrder: `${entryIndex}:${partIndex}`,
         });
-        consumedChars += part.length + 1;
+        consumedChars = partStart + part.length;
       });
     });
   });
@@ -216,6 +249,11 @@ function groupTranscriptEntries(entries, limits = TRANSCRIPT_SEGMENT_LIMITS) {
   };
 
   pieces.forEach((piece) => {
+    // Check before appending so a whole caption cannot overshoot the limits.
+    if (!hasSentenceBoundaries && current && (
+      normalizeCaptionText(`${current.text} ${piece.text}`).length > limits.maxChars ||
+      piece.end - current.start > limits.maxSeconds
+    )) flush();
     if (!current) current = { start: piece.start, text: "" };
     current.text = normalizeCaptionText(`${current.text} ${piece.text}`);
     const elapsed = Math.max(0, piece.start - current.start);
@@ -231,15 +269,15 @@ function groupTranscriptEntries(entries, limits = TRANSCRIPT_SEGMENT_LIMITS) {
       atNaturalBoundary &&
       (current.text.length >= limits.maxChars || elapsed >= limits.maxSeconds);
     const reachedHardGuardrail =
-      current.text.length >= Math.round(limits.maxChars * 1.2) ||
-      elapsed >= limits.maxSeconds + 5;
+      current.text.length >= limits.maxChars ||
+      piece.end - current.start >= limits.maxSeconds;
 
-    if (
+    if (hasSentenceBoundaries ? piece.semanticEnd : (
       (atNaturalBoundary && (comfortablySized || elapsed >= 8)) ||
       (atNaturalBoundary && reachedIdeal) ||
       reachedGuardrail ||
       reachedHardGuardrail
-    ) {
+    )) {
       flush();
     }
   });
@@ -253,15 +291,16 @@ function groupTranscriptEntries(entries, limits = TRANSCRIPT_SEGMENT_LIMITS) {
 // ============================================================
 
 document.addEventListener("DOMContentLoaded", async () => {
-  setTranscriptModeButtons("original");
+  await loadDisplayLanguageMode(null);
   setupEventListeners();
+  await loadVocabulary();
   await evictOldCacheEntries(20);
 
   const configStatus = await chrome.runtime.sendMessage({
     action: "checkConfig",
   });
 
-  if (!configStatus.hasSupadataKey || !configStatus.hasAiKey) {
+  if (!configStatus.hasAiKey && !window.digestReader) {
     showConfigError(configStatus);
     return;
   }
@@ -271,6 +310,24 @@ document.addEventListener("DOMContentLoaded", async () => {
 
 // Listen for messages from the Digest button on YouTube page
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === "followPlayback") {
+    const validVideo =
+      sender.tab?.id === youtubeTabId && message.videoId === currentVideoId;
+    sendResponse({ success: validVideo && resumePlaybackFollowing() });
+    return false;
+  }
+
+  if (message.action === "navigateSentence") {
+    if (sender.tab?.id !== youtubeTabId || message.videoId !== currentVideoId) {
+      sendResponse({ success: false, error: "Video changed" });
+      return false;
+    }
+    void navigateTranscriptSentence(message.direction, message.videoId)
+      .then(sendResponse)
+      .catch((error) => sendResponse({ success: false, error: error.message }));
+    return true;
+  }
+
   if (message.action === "startDigestFromButton") {
     // Load the digest for the current video. Served from cache when we've
     // seen this video before (no API calls); fetched fresh otherwise.
@@ -290,6 +347,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .getElementById("notesFilterAll")
       ?.classList.contains("active");
     loadNotes(filterAll ? null : currentVideoId);
+    sendResponse({ success: true });
+  }
+  if (
+    message.action === "closeDigestPanel" &&
+    !window.digestReader &&
+    (!message.tabId || message.tabId === youtubeTabId)
+  ) {
+    void saveCurrentTranscriptViewState();
+    window.close();
     sendResponse({ success: true });
   }
   return false;
@@ -339,7 +405,8 @@ function panelIsShowingResults() {
  * refresh the digest when the video changed.
  */
 function handleFrontTabUrl(url) {
-  if (!(url || "").startsWith("https://www.youtube.com")) {
+  if (window.digestReader) return;
+  if (!(url || "").startsWith("https://www.youtube.com") && !extractVideoId(url)?.startsWith("academy:") && !extractVideoId(url)?.startsWith("descript:")) {
     // Start the position save, then close in this same event callback. Chrome
     // does not reliably honor window.close() after an asynchronous wait.
     void saveCurrentTranscriptViewState();
@@ -351,6 +418,9 @@ function handleFrontTabUrl(url) {
   // Refresh when the video changed, or when we're not currently showing
   // results (e.g. user went home, then clicked back into the same video).
   if (newVideoId !== currentVideoId || !panelIsShowingResults()) {
+    // Invalidate requests for the previous video as soon as navigation starts,
+    // before the delayed metadata refresh runs.
+    if (newVideoId !== currentVideoId) digestGeneration += 1;
     scheduleDigestRefresh();
   }
 }
@@ -372,6 +442,7 @@ function getNavigationUrl(changeInfo, tab) {
 // no-reload navigation. The completion event is a deliberate second close
 // attempt for the first non-YouTube page.
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (window.digestReader) return;
   if (!tab.active) return;
   if (panelWindowId !== null && tab.windowId !== panelWindowId) return;
   const url = getNavigationUrl(changeInfo, tab);
@@ -382,18 +453,51 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // Fires when a different tab comes to the front — switching tabs, or a new
 // tab being opened (including ones opened by clicking links in other apps).
 chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
+  if (window.digestReader) return;
   if (panelWindowId !== null && windowId !== panelWindowId) return;
+  // Invalidate pending metadata and transcripts before awaiting the tab lookup.
+  const checkGeneration = ++tabCheckGeneration;
+  digestGeneration += 1;
+  digestRequestGeneration += 1;
+  translationGeneration += 1;
+  youtubeTabId = null;
+  isAnalysisLoading = false;
+  stopPlaybackTracking();
+  showState("loading");
   try {
     const tab = await chrome.tabs.get(tabId);
-    // Brand-new tabs may not have committed their URL yet — fall back to
-    // the pending one so we judge where the tab is actually going.
-    handleFrontTabUrl(tab.url || tab.pendingUrl || "");
+    if (checkGeneration !== tabCheckGeneration) return;
+    const url = tab.url || tab.pendingUrl || "";
+    handleFrontTabUrl(url);
+    if (extractVideoId(url)) {
+      showState("loading");
+      scheduleDigestRefresh();
+    }
   } catch (e) {
-    // Tab closed before we could read it — nothing to do.
+    // The tab closed before it could be read.
   }
 });
 
 function setupEventListeners() {
+  document.getElementById("toggleTranscriptTimestampsBtn")?.addEventListener("click", event => {
+    transcriptTimestampsVisible = !transcriptTimestampsVisible;
+    event.currentTarget.setAttribute("aria-pressed", String(transcriptTimestampsVisible));
+    document.getElementById("transcriptList")?.classList.toggle("continuous-reading",
+      !transcriptTimestampsVisible && currentTranscriptMode !== "bilingual");
+  });
+  document.getElementById("openReaderBtn")?.addEventListener("click", async () => {
+    if (!currentVideoUrl || !youtubeTabId) return;
+    const url = new URL(chrome.runtime.getURL("reader.html"));
+    url.searchParams.set("url", currentVideoUrl);
+    url.searchParams.set("tabId", youtubeTabId);
+    await chrome.tabs.create({ url: url.href });
+  });
+  setupVocabularyControls();
+  document.addEventListener("keydown", handlePlaybackSpacebar);
+  document.addEventListener("keydown", handleSentenceShortcut);
+  document.addEventListener("keydown", handleFollowShortcut);
+  document.addEventListener("keydown", handleDigestShortcut);
+  document.addEventListener("keydown", handleVocabularyShortcut);
   // Tab switching
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.addEventListener("click", () => switchTab(tab.dataset.tab));
@@ -405,7 +509,9 @@ function setupEventListeners() {
       errorAction();
       return;
     }
-    if (currentVideoId) {
+    if (window.digestReader) {
+      void checkCurrentTab();
+    } else if (currentVideoId) {
       startDigest(currentVideoId, currentVideoUrl);
     }
   });
@@ -415,12 +521,30 @@ function setupEventListeners() {
   });
 
   // Transcript actions
+  document.getElementById("refreshTranscriptBtn")?.addEventListener("click", refreshTranscript);
+  // Detect a track switch while the panel stays open. Reading the descriptor
+  // is local and consumes no transcript or AI credits.
+  let checkingTrack = false;
+  setInterval(async () => {
+    if (checkingTrack || refreshTranscriptInProgress || !currentTranscript) return;
+    checkingTrack = true;
+    const videoId = currentVideoId;
+    const generation = digestGeneration;
+    try {
+      const track = await chrome.runtime.sendMessage({ action: "getCaptionTrack", tabId: youtubeTabId, videoId });
+      if (generation === digestGeneration && track?.videoId === videoId && track.key !== currentTranscriptSourceKey) {
+        await startDigest(videoId, currentVideoUrl);
+      }
+    } catch (error) { debugLog("Caption track check unavailable", error); }
+    finally { checkingTrack = false; }
+  }, 3000);
   document
     .getElementById("copyTranscriptBtn")
     ?.addEventListener("click", copyTranscript);
   document
     .getElementById("exportTranscriptBtn")
     ?.addEventListener("click", exportTranscript);
+  document.getElementById("exportHighlightsBtn")?.addEventListener("click", openHighlightExport);
   document.querySelectorAll(".transcript-mode-btn").forEach((button) => {
     button.addEventListener("click", () => {
       handleDisplayLanguageModeChange(button.dataset.transcriptMode);
@@ -436,17 +560,18 @@ function setupEventListeners() {
   // Follow playback button — re-enables auto-scroll after user scrolled away
   document
     .getElementById("followPlaybackBtn")
-    ?.addEventListener("click", () => {
-      autoScrollEnabled = true;
-      document.getElementById("followPlaybackBtn").style.display = "none";
-      // Jump straight back to the line currently being spoken. We scroll
-      // directly (not via playbackTrackingTick) because the tick skips
-      // entries that are already highlighted — and the current line almost
-      // always IS highlighted, which made this button appear to do nothing.
-      if (!scrollToActiveEntry()) {
-        playbackTrackingTick(); // No highlight yet — let a tick establish one
-      }
-    });
+    ?.addEventListener("click", resumePlaybackFollowing);
+
+  document.getElementById("autoScrollToggleBtn")?.addEventListener("click", () => {
+    autoScrollLocked = !autoScrollLocked;
+    autoScrollEnabled = autoScrollLocked;
+    const button = document.getElementById("autoScrollToggleBtn");
+    button.setAttribute("aria-pressed", String(autoScrollLocked));
+    button.textContent = autoScrollLocked ? "Auto On" : "Auto Off";
+    document.getElementById("followPlaybackBtn").style.display = autoScrollLocked ? "none" : "block";
+    if (autoScrollLocked) resumePlaybackFollowing();
+    else scheduleTranscriptViewStateSave();
+  });
 
   // Notes filter buttons
   document.getElementById("notesFilterThis")?.addEventListener("click", () => {
@@ -457,6 +582,116 @@ function setupEventListeners() {
     setNotesFilter(true);
     loadNotes(null); // Load all notes
   });
+}
+
+/** Space controls the video while keyboard focus is inside the side panel. */
+function handlePlaybackSpacebar(event) {
+  if (
+    (event.code !== "Space" && event.key !== " ") ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.altKey ||
+    event.shiftKey ||
+    event.repeat ||
+    !currentVideoId ||
+    !youtubeTabId
+  ) {
+    return;
+  }
+
+  const target = event.target;
+  if (
+    target?.closest?.(
+      "input, textarea, select, [contenteditable], [role='textbox']",
+    )
+  ) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+  void chrome.tabs
+    .sendMessage(youtubeTabId, { action: "togglePlayback" })
+    .catch((error) =>
+      console.error("[YouTube Digest] Playback shortcut error:", error),
+    );
+}
+
+function handleDigestShortcut(event) {
+  if (
+    event.key?.toLowerCase() !== "d" || event.repeat ||
+    event.ctrlKey || event.metaKey || event.altKey || event.shiftKey ||
+    event.target?.closest?.(
+      "input, textarea, select, [contenteditable], [role='textbox']",
+    )
+  ) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  switchTab("transcript");
+}
+
+function handleSentenceShortcut(event) {
+  if (
+    (event.key !== "[" && event.key !== "]") ||
+    event.ctrlKey ||
+    event.metaKey ||
+    event.altKey ||
+    event.shiftKey ||
+    event.repeat ||
+    !currentVideoId ||
+    !youtubeTabId ||
+    !currentTranscript?.length ||
+    event.target?.closest?.(
+      "input, textarea, select, [contenteditable], [role='textbox']",
+    )
+  ) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+  void navigateTranscriptSentence(
+    event.key === "[" ? "previous" : "next",
+    currentVideoId,
+  ).catch((error) =>
+    console.error("[YouTube Digest] Sentence shortcut error:", error),
+  );
+}
+
+function handleFollowShortcut(event) {
+  if (
+    event.key !== "\\" ||
+    event.ctrlKey || event.metaKey || event.altKey || event.shiftKey ||
+    event.repeat || !currentVideoId || !currentTranscript?.length ||
+    event.target?.closest?.(
+      "input, textarea, select, [contenteditable], [role='textbox']",
+    )
+  ) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  resumePlaybackFollowing();
+}
+
+function resumePlaybackFollowing() {
+  if (!currentVideoId || !currentTranscript?.length) {
+    return false;
+  }
+  const transcriptWasActive = transcriptTabIsActive();
+  if (!transcriptWasActive) switchTab("transcript");
+  autoScrollEnabled = true;
+  document.getElementById("followPlaybackBtn").style.display = "none";
+  const follow = () => {
+    // Scroll now, then refresh the active line from the player's exact time.
+    scrollToActiveEntry();
+    void playbackTrackingTick();
+    void saveCurrentTranscriptViewState();
+  };
+  // Tab switching restores its old scroll position in a frame first.
+  if (transcriptWasActive) follow();
+  else requestAnimationFrame(follow);
+  return true;
 }
 
 function setNotesFilter(showAll) {
@@ -473,15 +708,17 @@ function setNotesFilter(showAll) {
 // ============================================================
 
 async function checkCurrentTab() {
+  const checkGeneration = ++tabCheckGeneration;
   try {
     // The panel belongs only to the active tab. Looking for another open
     // YouTube tab here can keep an old transcript visible on a non-YouTube
     // page, so never fall back to background tabs.
-    const tabs = await chrome.tabs.query({
-      active: true,
-      lastFocusedWindow: true,
-    });
+    const windowId = panelWindowId ?? (await chrome.windows.getCurrent()).id;
+    const tabs = window.digestReader
+      ? [await window.digestReader.resolveSourceTab()]
+      : await chrome.tabs.query({ active: true, windowId });
     const tab = tabs[0] || null;
+    if (checkGeneration !== tabCheckGeneration) return;
 
     debugLog("[YouTube Digest Panel] Found tab:", tab?.id, tab?.url);
 
@@ -490,13 +727,14 @@ async function checkCurrentTab() {
       return;
     }
 
-    if (!tab.url.startsWith("https://www.youtube.com")) {
+    if (!tab.url.startsWith("https://www.youtube.com") && !extractVideoId(tab.url)?.startsWith("academy:") && !extractVideoId(tab.url)?.startsWith("descript:")) {
       handleFrontTabUrl(tab.url);
       return;
     }
 
     // Store the tab ID for reliable messaging later
     youtubeTabId = tab.id;
+    if (!window.digestReader) registerSidePanelLifecycle(youtubeTabId);
 
     const videoId = extractVideoId(tab.url);
 
@@ -507,16 +745,25 @@ async function checkCurrentTab() {
         // Route through background script for reliable message passing
         const result = await chrome.runtime.sendMessage({
           action: "relayToContent",
+          tabId: tab.id,
+          videoId,
           payload: { action: "getVideoInfo" },
         });
+        if (checkGeneration !== tabCheckGeneration) return;
         debugLog("[YouTube Digest Panel] getVideoInfo result:", result);
-        if (result.success && result.response) {
+        if (result.success && result.response?.videoId === videoId) {
           currentVideoTitle = result.response.title || "";
           currentChannelName = result.response.channelName || "";
           currentVideoDescription = result.response.description || "";
           currentVideoDuration = result.response.duration || 0;
+        } else {
+          currentVideoTitle = "";
+          currentChannelName = "";
+          currentVideoDescription = "";
+          currentVideoDuration = 0;
         }
       } catch (e) {
+        if (checkGeneration !== tabCheckGeneration) return;
         console.error("[YouTube Digest Panel] getVideoInfo error:", e);
         currentVideoTitle = "";
         currentChannelName = "";
@@ -524,19 +771,45 @@ async function checkCurrentTab() {
         currentVideoDuration = 0;
       }
 
-      startDigest(videoId, tab.url);
+      void startDigest(videoId, tab.url, { tabId: tab.id });
     } else {
       showState("welcome");
     }
   } catch (error) {
     console.error("Tab check error:", error);
-    showState("welcome");
+    if (window.digestReader) {
+      document.getElementById("errorMessage").textContent = error.message;
+      showState("error");
+    } else showState("welcome");
   }
+}
+
+function registerSidePanelLifecycle(tabId) {
+  if (!Number.isInteger(tabId) || typeof chrome.runtime.connect !== "function") {
+    return;
+  }
+  if (!sidePanelLifecyclePort) {
+    sidePanelLifecyclePort = chrome.runtime.connect({
+      name: "ytd-sidepanel-lifecycle",
+    });
+    sidePanelLifecyclePort.onDisconnect.addListener(() => {
+      sidePanelLifecyclePort = null;
+    });
+  }
+  sidePanelLifecyclePort.postMessage({ action: "registerSidePanel", tabId });
 }
 
 function extractVideoId(url) {
   try {
     const urlObj = new URL(url);
+    if (urlObj.hostname === "share.descript.com" && urlObj.protocol === "https:") {
+      const video=urlObj.pathname.match(/^\/(?:view|embed)\/([A-Za-z0-9_-]+)\/?$/);
+      return video ? `descript:${video[1]}` : null;
+    }
+    if (urlObj.hostname === "academy.langchain.com") {
+      const lesson = urlObj.pathname.match(/^\/courses\/take\/([^/]+)\/(?:lessons|multimedia)\/(\d+)(?:-|$)/);
+      return lesson ? `academy:${lesson[1]}:${lesson[2]}` : null;
+    }
 
     if (
       urlObj.hostname.includes("youtube.com") &&
@@ -563,26 +836,88 @@ function extractVideoId(url) {
 // DIGEST PIPELINE
 // ============================================================
 
-async function startDigest(videoId, videoUrl) {
-  // Check if we already have this video loaded in memory
-  if (videoId === currentVideoId && currentAnalysis) {
+async function refreshTranscript() {
+  if (refreshTranscriptInProgress || !currentVideoId) return;
+  refreshTranscriptInProgress = true;
+  const button = document.getElementById("refreshTranscriptBtn");
+  if (button) button.disabled = true;
+  const videoId = currentVideoId;
+  const videoUrl = currentVideoUrl;
+  const generation = ++digestGeneration;
+  translationGeneration += 1;
+  stopPlaybackTracking();
+  if (transcriptScrollObserver) transcriptScrollObserver.disconnect();
+  transcriptScrollObserver = null;
+  currentAnalysis = null;
+  currentTranscript = null;
+  currentTranscriptText = null;
+  currentTranscriptTimestamped = null;
+  isAnalysisLoading = false;
+  resetTranscriptSearch();
+  clearAnalysisResults();
+  document.getElementById("transcriptList").innerHTML = "";
+  lastTranscriptScrollTop = 0;
+  pendingTranscriptViewState = null;
+  autoScrollEnabled = autoScrollLocked;
+  showState("loading");
+  updateLoading("Refreshing transcript", "Loading the current YouTube caption track…");
+  try {
+    await chrome.storage.local.remove(`digest_${videoId}`);
+    if (generation !== digestGeneration || currentVideoId !== videoId) return;
+    await startDigest(videoId, videoUrl, { forceRefresh: true });
+  } catch (error) {
+    if (generation === digestGeneration && currentVideoId === videoId) showError("Refresh failed", error.message);
+  } finally {
+    refreshTranscriptInProgress = false;
+    if (button) button.disabled = false;
+  }
+}
+
+async function startDigest(videoId, videoUrl, { forceRefresh = false, tabId = youtubeTabId } = {}) {
+  const requestGeneration = ++digestRequestGeneration;
+  const previousGeneration = digestGeneration;
+  const track = await chrome.runtime.sendMessage({
+    action: "getCaptionTrack", videoId, tabId,
+  }).catch(() => null);
+  if (requestGeneration !== digestRequestGeneration || previousGeneration !== digestGeneration || tabId !== youtubeTabId) return;
+  const sourceKey = track?.videoId === videoId ? track.key : null;
+  // Reuse memory only when both video and selected caption track still match.
+  if (!forceRefresh && videoId === currentVideoId && currentTranscript && sourceKey === currentTranscriptSourceKey) {
     showState("results");
+    if (!currentAnalysis && !isAnalysisLoading && resultTabIsActive("overview")) void triggerAnalysis();
     return;
   }
+
+  const generation = ++digestGeneration;
+  translationGeneration += 1;
+  if (transcriptScrollObserver) transcriptScrollObserver.disconnect();
+  transcriptScrollObserver = null;
+  for (const cache of [transcriptParagraphCache, interfaceTranslationCache, interfaceTranslationFailures]) {
+    for (const key of cache.keys()) if (key.startsWith(`${videoId}:`)) cache.delete(key);
+  }
+  currentAnalysis = null;
+  currentTranscript = null;
+  currentTranscriptText = null;
+  currentTranscriptTimestamped = null;
+  isAnalysisLoading = false;
+  clearAnalysisResults();
 
   const videoChanged = videoId !== currentVideoId;
 
   // Every video change invalidates observer work and in-flight translations.
   if (videoChanged) {
+    autoScrollEnabled = autoScrollLocked;
     translationGeneration += 1;
     if (transcriptScrollObserver) transcriptScrollObserver.disconnect();
     transcriptScrollObserver = null;
     resetTranscriptSearch();
     lastTranscriptScrollTop = 0;
-    pendingTranscriptViewState = await loadTranscriptViewState(videoId);
-    // An unseen video always starts in Original, so opening it never spends
-    // translation tokens. A saved choice is restored only for this video.
+    // Opening a video starts at playback rather than a saved reading position.
+    pendingTranscriptViewState = null;
+    // Every video opens in Transcript using the configured display language.
     currentTranscriptMode = await loadDisplayLanguageMode(videoId);
+    if (generation !== digestGeneration) return;
+    switchTab("transcript");
     document
       .getElementById("contentArea")
       ?.classList.toggle(
@@ -592,16 +927,23 @@ async function startDigest(videoId, videoUrl) {
   }
 
   // Check cache for this video
-  const cached = await loadFromCache(videoId);
+  const cached = forceRefresh ? null : await loadFromCache(videoId, sourceKey);
+  if (generation !== digestGeneration) return;
   if (cached) {
     debugLog("Loading from cache:", videoId);
     currentVideoId = videoId;
     currentVideoUrl = videoUrl;
-    currentAnalysis = cached.analysis || null;
+    currentAnalysis =
+      cached.analysis &&
+      cached.analysisSignature === transcriptSignature(cached.transcriptTimestamped)
+        ? cached.analysis || null
+        : null;
     currentTranscript = cached.transcript;
     currentTranscriptText = cached.transcriptText;
     currentTranscriptTimestamped = cached.transcriptTimestamped;
     currentTranscriptLanguage = cached.transcriptLanguage || null;
+    currentTranscriptSourceKey = cached.transcriptSourceKey || null;
+    currentTranscriptSource = cached.transcriptSource || "supadata";
     isAnalysisLoading = false;
 
     // Restore semantic-segment translations from persistent storage.
@@ -635,6 +977,9 @@ async function startDigest(videoId, videoUrl) {
     showState("results");
     document.getElementById("tabsNav").style.display = "flex";
     restorePendingTranscriptViewState(videoId);
+    if (!currentAnalysis && resultTabIsActive("overview")) {
+      void triggerAnalysis();
+    }
 
     // Load notes for this video
     loadNotes(videoId);
@@ -667,7 +1012,10 @@ async function startDigest(videoId, videoUrl) {
   const transcriptResult = await chrome.runtime.sendMessage({
     action: "fetchTranscript",
     videoId: videoId,
+    tabId,
+    sourceKey,
   });
+  if (generation !== digestGeneration) return;
 
   if (!transcriptResult.success) {
     if (transcriptResult.error === "NO_SUPADATA_KEY") {
@@ -688,6 +1036,8 @@ async function startDigest(videoId, videoUrl) {
   currentTranscriptText = transcriptResult.transcriptText;
   currentTranscriptTimestamped = transcriptResult.transcriptTextTimestamped;
   currentTranscriptLanguage = transcriptResult.language || null;
+  currentTranscriptSourceKey = transcriptResult.sourceKey || null;
+  currentTranscriptSource = transcriptResult.source || "supadata";
 
   // Render transcript immediately (no LLM needed)
   renderTranscript();
@@ -705,13 +1055,23 @@ async function startDigest(videoId, videoUrl) {
   // Save transcript to cache (without analysis)
   await saveToCache(videoId);
 
-  // DON'T run LLM analysis automatically - wait for user to click Overview tab
-  // This saves tokens when user just wants to see the transcript
+  if (generation === digestGeneration && resultTabIsActive("overview")) {
+    void triggerAnalysis();
+  }
+
+  // Generate analysis only while Overview is visible.
 }
 
 // ============================================================
 // RENDERING
 // ============================================================
+
+function clearAnalysisResults() {
+  const chapterList = document.getElementById("chapterList");
+  const quotesList = document.getElementById("quotesList");
+  if (chapterList) chapterList.innerHTML = "";
+  if (quotesList) quotesList.innerHTML = "";
+}
 
 function interfaceTranslationCacheKey(surface, id, text) {
   return `${currentVideoId || "none"}:zh:${surface}:${id}:${text}`;
@@ -896,7 +1256,7 @@ function renderAnalysisResults(analysis) {
     li.className = "chapter-item";
     li.dataset.seconds = chapter.timestampSeconds;
     li.innerHTML = `
-      <span class="chapter-timestamp">${escapeHtml(chapter.timestamp)}</span>
+      <span class="chapter-timestamp">${currentTranscriptSource === "academy-lesson-text" ? "Section" : escapeHtml(chapter.timestamp)}</span>
       <div class="chapter-content">
         <span class="chapter-title">${renderLocalizedContent(chapter.title, "overview", `chapter-${index}-title`)}</span>
         <span class="chapter-summary">${renderLocalizedContent(chapter.summary || "", "overview", `chapter-${index}-summary`)}</span>
@@ -926,7 +1286,7 @@ function renderAnalysisResults(analysis) {
     div.innerHTML = `
       <div class="quote-text">${renderLocalizedContent(quote.quote, "overview", `quote-${index}`)}</div>
       <div class="quote-meta">
-        <span class="quote-timestamp">${escapeHtml(quote.timestamp)}</span>
+        <span class="quote-timestamp">${currentTranscriptSource === "academy-lesson-text" ? "Lesson" : escapeHtml(quote.timestamp)}</span>
         <div class="quote-actions">
           <button class="quote-save-note-btn" title="Save this quote as a note">Note</button>
           <button class="quote-copy-btn" title="Copy this quote">Copy</button>
@@ -992,6 +1352,7 @@ async function saveQuoteAsNote(quote, btn) {
       timestamp: quote.timestampSeconds,
       videoTitle: currentVideoTitle,
       channelName: currentChannelName,
+      selectedText: quote.quote,
     });
 
     if (result.success) {
@@ -1047,27 +1408,66 @@ function hasNonCollapsedTextSelection() {
   );
 }
 
-/**
- * Preserves normal row-click seeking while keeping text selection inert.
- */
-function seekFromTranscriptEntryClick(event, seconds) {
-  if (hasNonCollapsedTextSelection()) {
+function renderTranscriptReplay(seconds, timestamp) {
+  if (currentTranscriptSource === "academy-lesson-text") return '<span class="transcript-time">Text</span>';
+  return `<button class="transcript-time transcript-replay-btn" type="button" aria-label="Replay from ${timestamp}" title="Replay from ${timestamp}"><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path d="M4 2.5 12 8l-8 5.5Z" fill="currentColor"/></svg><span>${timestamp}</span></button>`;
+}
+
+function setupTranscriptReplay(row, seconds) {
+  row.addEventListener('contextmenu', event => {
+    if (currentTranscriptSource === "academy-lesson-text" || !Number.isFinite(Number(seconds))) return;
     event.preventDefault();
     event.stopPropagation();
-    return;
-  }
+    dismissSelectionActions(true);
+    void seekTo(seconds);
+  });
+  row.querySelector('.transcript-replay-btn')?.addEventListener('click',event=>{
+    event.preventDefault();
+    event.stopPropagation();
+    dismissSelectionActions(true);
+    void seekTo(seconds);
+  });
+}
 
-  seekTo(seconds);
+function transcriptWordBounds(text, offset) {
+  const tokens = [...String(text).matchAll(/[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*/gu)];
+  const match = tokens.find(token=>offset >= token.index && offset < token.index+token[0].length);
+  return match ? {start:match.index,end:match.index+match[0].length} : null;
+}
+
+function renderTranscriptSourceBadge() {
+  const badge = document.createElement("div");
+  badge.id = "transcriptSourceBadge";
+  badge.className = "transcript-source-badge";
+  badge.textContent = currentTranscriptSource === "academy-lesson-text"
+    ? "Academy written lesson · no timestamps"
+    : currentTranscriptSource === "academy-player"
+    ? "Academy player captions · English"
+    : currentTranscriptSource === "descript-player"
+    ? "Descript player captions · English"
+    : currentTranscriptSource === "youtube-player"
+    ? `YouTube caption track · ${currentTranscriptLanguage || "Original"}`
+    : `Provider captions · ${currentTranscriptLanguage || "Original"} (track may differ)`;
+  badge.title = currentTranscriptSource === "descript-player" ? "Loaded from this Descript video’s native English captions." : currentTranscriptSource === "academy-lesson-text"
+    ? "Visible written lesson content, not a video transcript."
+    : currentTranscriptSource === "academy-player"
+    ? "Loaded from the lesson player’s English caption track."
+    : currentTranscriptSource === "youtube-player"
+    ? "Loaded directly from the YouTube player’s caption track."
+    : "YouTube’s track could not be read directly. These native provider captions match the requested language, but may differ from the player’s track. Refresh to retry.";
+  document.getElementById("transcriptList")?.before(badge);
 }
 
 function renderTranscript() {
   if (!currentTranscript) return;
 
   const transcriptList = document.getElementById("transcriptList");
+  transcriptList.classList.toggle("continuous-reading", !transcriptTimestampsVisible);
   transcriptList.innerHTML = "";
 
   const existingBadge = document.getElementById("transcriptSourceBadge");
   if (existingBadge) existingBadge.remove();
+  renderTranscriptSourceBadge();
 
   // Group entries using smart sentence-boundary + time-guardrail logic
   const grouped = groupTranscriptEntries(currentTranscript);
@@ -1082,15 +1482,16 @@ function renderTranscript() {
     const timestamp = `${minutes}:${String(seconds).padStart(2, "0")}`;
 
     div.innerHTML = `
-      <span class="transcript-time">${timestamp}</span>
+      ${renderTranscriptReplay(group.start, timestamp)}
       <span class="transcript-text">${renderSubtitleInlineMarkup(group.text)}</span>
     `;
 
-    div.addEventListener("click", (event) =>
-      seekFromTranscriptEntryClick(event, group.start),
-    );
+    setupTranscriptReplay(div, group.start);
     transcriptList.appendChild(div);
   });
+
+  applyVocabularyHighlights(transcriptList);
+  void autoCollectVocabulary();
 
   // Reapply an active query after a language mode rerenders the transcript.
   refreshTranscriptSearch({ preserveIndex: false, scroll: false });
@@ -1216,7 +1617,7 @@ function revealCurrentTranscriptSearchMatch({ scroll = true } = {}) {
   mark.closest(".transcript-entry")?.classList.add("search-current");
 
   if (!scroll) return;
-  if (autoScrollInterval) {
+  if (autoScrollInterval && !autoScrollLocked) {
     autoScrollEnabled = false;
     document.getElementById("followPlaybackBtn").style.display = "block";
   }
@@ -1332,6 +1733,268 @@ function setupTranscriptSearch() {
   next?.addEventListener("click", () => moveTranscriptSearch(1));
 }
 
+// ============================================================
+// VOCABULARY HIGHLIGHTING
+// ============================================================
+
+function normalizeVocabularyTerm(term) {
+  return String(term || "")
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLocaleLowerCase();
+}
+
+function isVocabularyBoundaryCharacter(character) {
+  return Boolean(character && /[\p{L}\p{N}_'’-]/u.test(character));
+}
+
+/**
+ * Finds non-overlapping vocabulary matches, preferring longer saved phrases.
+ * Latin words require real word boundaries, while CJK terms can match inline.
+ */
+function findVocabularyMatches(text, entries) {
+  const source = String(text || "");
+  const foldedSource = source.toLocaleLowerCase();
+  const candidates = (Array.isArray(entries) ? entries : [])
+    .map((entry) => ({
+      entry,
+      term: normalizeVocabularyTerm(entry?.term),
+    }))
+    .filter((candidate) => candidate.term)
+    .sort((a, b) => b.term.length - a.term.length);
+  const matches = [];
+
+  candidates.forEach(({ entry, term }) => {
+    let fromIndex = 0;
+    while (fromIndex <= foldedSource.length - term.length) {
+      const start = foldedSource.indexOf(term, fromIndex);
+      if (start < 0) break;
+      const end = start + term.length;
+      const needsStartBoundary = /[\p{Script=Latin}\p{N}_'’-]/u.test(term[0]);
+      const needsEndBoundary = /[\p{Script=Latin}\p{N}_'’-]/u.test(term.at(-1));
+      const boundaryIsValid =
+        (!needsStartBoundary || !isVocabularyBoundaryCharacter(foldedSource[start - 1])) &&
+        (!needsEndBoundary || !isVocabularyBoundaryCharacter(foldedSource[end]));
+      const overlaps = matches.some(
+        (match) => start < match.end && end > match.start,
+      );
+      if (boundaryIsValid && !overlaps) matches.push({ start, end, entry });
+      fromIndex = start + Math.max(1, term.length);
+    }
+  });
+
+  return matches.sort((a, b) => a.start - b.start);
+}
+
+function clearVocabularyHighlights(container) {
+  container
+    ?.querySelectorAll("mark.vocabulary-highlight, mark.user-highlight")
+    .forEach((mark) => {
+      const parent = mark.parentNode;
+      mark.replaceWith(document.createTextNode(mark.textContent || ""));
+      parent?.normalize();
+    });
+}
+
+// Only highlight meanings of vocabulary actually present in this source row.
+function findTranslatedVocabularyMatches(text, sourceText, entries, aligned = []) {
+  const relevant = [...new Set(findVocabularyMatches(sourceText, entries).map(match => match.entry))];
+  const aliases = relevant.flatMap(entry => {
+    const meanings = String(entry.meaningZh || "")
+      .replace(/[（(][^）)]*[）)]/g, "")
+      .split(/[，,；;、\/\n]/)
+      .map(meaning => meaning.trim().replace(/[。.!！]+$/, ""))
+      .filter(meaning => /\p{Script=Han}/u.test(meaning) && meaning.length >= 2);
+    return [entry.term, ...meanings, ...meanings.map(meaning => meaning.replace(/的$/, "")),
+      ...aligned.filter(match=>match.id === entry.id).map(match=>match.text)]
+      .filter(Boolean).map(term => ({...entry, term, vocabularyEntry:entry}));
+  });
+  return findVocabularyMatches(text, aliases).map(match => ({...match, entry:match.entry.vocabularyEntry}));
+}
+
+const vocabularyAlignmentCache = new Map();
+let vocabularyAlignmentRunning = false;
+let vocabularyAlignmentTimer = null;
+
+function vocabularyAlignmentRow(row) {
+  if (!row) return null;
+  const source = row.dataset.originalText || row.querySelector('.transcript-original')?.textContent || '';
+  const translationNode = row.querySelector('.transcript-translation:not(.translation-pending):not(.translation-error)');
+  const translation = translationNode?.textContent || '';
+  const entries = [...new Set(findVocabularyMatches(source,currentVocabulary).map(match=>match.entry))];
+  if (!source || !translation || !entries.length) return null;
+  const key = 'ytd_vocab_alignment_v1:' + transcriptSignature(JSON.stringify([source,translation,entries.map(e=>[e.id,e.term,e.meaningZh])]));
+  return {id:key,source,translation,entries:entries.map(e=>({id:e.id,term:e.term,meaningZh:e.meaningZh}))};
+}
+
+function scheduleVocabularyAlignment() {
+  if (vocabularyAlignmentRunning || vocabularyAlignmentTimer !== null) return;
+  vocabularyAlignmentTimer = setTimeout(() => {
+    vocabularyAlignmentTimer = null;
+    void alignDisplayedVocabulary();
+  },150);
+}
+
+async function alignDisplayedVocabulary() {
+  if (vocabularyAlignmentRunning) return;
+  vocabularyAlignmentRunning = true;
+  const videoId = currentVideoId;
+  let completed = false;
+  try {
+    const rows = [...(document.getElementById('transcriptList')?.querySelectorAll('.transcript-entry') || [])]
+      .map(vocabularyAlignmentRow).filter(row=>row && !vocabularyAlignmentCache.has(row.id));
+    for (let start=0;start<rows.length;start+=4) {
+      if (videoId !== currentVideoId) break;
+      const batch=rows.slice(start,start+4);
+      const saved=await chrome.storage.local.get(batch.map(row=>row.id));
+      const missing=batch.filter(row=>!Array.isArray(saved[row.id]));
+      batch.forEach(row=>{if(Array.isArray(saved[row.id])) vocabularyAlignmentCache.set(row.id,saved[row.id]);});
+      if (missing.length) {
+        const result=await chrome.runtime.sendMessage({action:'alignVocabularyTranslation',rows:missing});
+        const persist={};
+        missing.forEach(row=>{
+          const matches=result?.success ? result.rows?.find(item=>item.id===row.id)?.matches || [] : [];
+          vocabularyAlignmentCache.set(row.id,matches);
+          if(result?.success) persist[row.id]=matches;
+        });
+        if(Object.keys(persist).length) await chrome.storage.local.set(persist);
+      }
+      if (videoId === currentVideoId) refreshVocabularyHighlights();
+    }
+    completed = true;
+  } catch(error) { console.error('[YouTube Digest] Vocabulary alignment:',error); }
+  finally {
+    vocabularyAlignmentRunning=false;
+    if (completed && [...(document.getElementById('transcriptList')?.querySelectorAll('.transcript-entry') || [])]
+      .some(row=>{const candidate=vocabularyAlignmentRow(row);return candidate && !vocabularyAlignmentCache.has(candidate.id);})) scheduleVocabularyAlignment();
+  }
+}
+
+function attachVocabularyTooltip(mark, entry) {
+  mark.tabIndex = 0;
+  const hide = () => {
+    document.getElementById('vocabularyMeaningTooltip')?.remove();
+    mark.removeAttribute('aria-describedby');
+    mark.closest('.transcript-entry')?.querySelectorAll('.vocabulary-paired').forEach(node=>node.classList.remove('vocabulary-paired'));
+  };
+  const show = () => {
+    hide();
+    const tooltip=document.createElement('div');
+    tooltip.id='vocabularyMeaningTooltip';
+    tooltip.className='vocabulary-meaning-tooltip';
+    tooltip.setAttribute('role','tooltip');
+    tooltip.textContent=[entry.term,entry.ipa,entry.meaningZh || '暂无中文释义',entry.meaningEn].filter(Boolean).join('\n');
+    document.body.appendChild(tooltip);
+    mark.setAttribute('aria-describedby',tooltip.id);
+    const rect=mark.getBoundingClientRect();
+    tooltip.style.left=`${Math.max(8,Math.min(rect.left,window.innerWidth-tooltip.offsetWidth-8))}px`;
+    tooltip.style.top=`${Math.max(8,Math.min(rect.bottom+8,window.innerHeight-tooltip.offsetHeight-8))}px`;
+    mark.closest('.transcript-entry')?.querySelectorAll('mark.vocabulary-highlight').forEach(node=>{
+      if(node.dataset.vocabularyId === entry.id) node.classList.add('vocabulary-paired');
+    });
+  };
+  mark.addEventListener('pointerenter',show);
+  mark.addEventListener('pointerleave',hide);
+  mark.addEventListener('focus',show);
+  mark.addEventListener('blur',hide);
+  mark.addEventListener('keydown',event=>{if(event.key==='Escape') hide();});
+}
+
+function markVocabularyTextNode(textNode) {
+  const translation = textNode.parentElement?.closest(".transcript-translation");
+  const row = textNode.parentElement?.closest(".transcript-entry");
+  if (translation?.matches(".translation-error, .translation-pending")) return;
+  const matches = translation
+    ? findTranslatedVocabularyMatches(textNode.nodeValue,
+        row?.dataset.originalText || row?.querySelector(".transcript-original")?.textContent || "", currentVocabulary,
+        vocabularyAlignmentCache.get(vocabularyAlignmentRow(row)?.id) || [])
+    : findVocabularyMatches(textNode.nodeValue, currentVocabulary);
+  if (!matches.length) return;
+
+  const fragment = document.createDocumentFragment();
+  let cursor = 0;
+  matches.forEach(({ start, end, entry }) => {
+    if (start > cursor) {
+      fragment.appendChild(document.createTextNode(textNode.nodeValue.slice(cursor, start)));
+    }
+    const mark = document.createElement("mark");
+    mark.className = "vocabulary-highlight";
+    mark.dataset.vocabularyId = entry.id || "";
+    attachVocabularyTooltip(mark, entry);
+    mark.textContent = textNode.nodeValue.slice(start, end);
+    fragment.appendChild(mark);
+    cursor = end;
+  });
+  if (cursor < textNode.nodeValue.length) {
+    fragment.appendChild(document.createTextNode(textNode.nodeValue.slice(cursor)));
+  }
+  textNode.parentNode.replaceChild(fragment, textNode);
+}
+
+function applyVocabularyHighlights(container) {
+  if (!container) return;
+  document.getElementById('vocabularyMeaningTooltip')?.remove();
+  // Opening a transcript must never paint AI-selected words or legacy marks.
+  // Manual ranges are managed separately by the shared highlighter (Option+Q).
+  clearVocabularyHighlights(container);
+}
+
+let manualTranscriptHighlights = [];
+async function loadManualTranscriptHighlights() {
+  const videoId=currentVideoId;
+  manualTranscriptHighlights=[];
+  const key=`ytd_manual_highlights:${videoId}`;
+  try {
+    const saved=(await chrome.storage.local.get(key))[key];
+    if(videoId !== currentVideoId) return;
+    manualTranscriptHighlights=Array.isArray(saved) ? saved : [];
+    refreshVocabularyHighlights();
+  } catch(error) { console.error('[YouTube Digest] Load highlights:',error); }
+}
+
+function applyManualTranscriptHighlights(container) {
+  container.querySelectorAll('mark.user-highlight').forEach(mark=>{
+    const parent=mark.parentNode;
+    mark.replaceWith(document.createTextNode(mark.textContent));
+    parent?.normalize();
+  });
+  const nodes=[];
+  const walker=document.createTreeWalker(container,NodeFilter.SHOW_TEXT,{
+    acceptNode(node) {return node.parentElement?.closest('button, .transcript-time, mark') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;},
+  });
+  while(walker.nextNode()) nodes.push(walker.currentNode);
+  const rows=[...container.querySelectorAll('.transcript-entry')];
+  nodes.forEach(node=>{
+    const row=node.parentElement?.closest('.transcript-entry');
+    const start=Number(row?.dataset.seconds);
+    const index=rows.indexOf(row);
+    const end=index >= 0 && index + 1 < rows.length ? Number(rows[index+1].dataset.seconds) : Infinity;
+    const matches=findVocabularyMatches(node.nodeValue,manualTranscriptHighlights.filter(item=>item.start >= start && item.start < end));
+    if(!matches.length) return;
+    const fragment=document.createDocumentFragment();
+    let cursor=0;
+    matches.forEach(match=>{
+      fragment.appendChild(document.createTextNode(node.nodeValue.slice(cursor,match.start)));
+      const mark=document.createElement('mark');
+      mark.className='user-highlight';
+      mark.textContent=node.nodeValue.slice(match.start,match.end);
+      fragment.appendChild(mark);
+      cursor=match.end;
+    });
+    fragment.appendChild(document.createTextNode(node.nodeValue.slice(cursor)));
+    node.parentNode.replaceChild(fragment,node);
+  });
+}
+
+function refreshVocabularyHighlights() {
+  const transcriptList = document.getElementById("transcriptList");
+  if (!transcriptList) return;
+  clearTranscriptSearchHighlights();
+  applyVocabularyHighlights(transcriptList);
+  refreshTranscriptSearch({ preserveIndex: true, scroll: false });
+}
+
 function getDisplayedTranscriptText() {
   if (currentTranscriptMode === "original") return currentTranscriptText || "";
   return getActiveTranscriptSegments()
@@ -1349,9 +2012,66 @@ function copyTranscript() {
   copyToClipboardWithFeedback(getDisplayedTranscriptText(), "copyTranscriptBtn");
 }
 
+async function openHighlightExport() {
+  const button = document.getElementById('exportHighlightsBtn');
+  const videoId = currentVideoId;
+  if (!videoId || !currentTranscript?.length) {
+    const label = button.innerHTML;
+    button.textContent = 'Load a transcript first';
+    setTimeout(() => { button.innerHTML = label; }, 2000);
+    return;
+  }
+  button.disabled = true;
+  try {
+    await window.digestHighlighter?.whenIdle();
+    const storageKey = `ytd_reader_highlights:${videoId}`;
+    const saved = (await chrome.storage.local.get(storageKey))[storageKey];
+    if (videoId !== currentVideoId) return;
+    const plainText = text => {
+      const element = document.createElement('span');
+      element.innerHTML = renderSubtitleInlineMarkup(text || '');
+      return element.textContent;
+    };
+    const text = DigestTranscriptExport.build({
+      title: currentVideoTitle,
+      url: currentVideoUrl || `https://youtube.com/watch?v=${videoId}`,
+      segments: getActiveTranscriptSegments().map(segment => ({
+        start: segment.start,
+        original: plainText(segment.text),
+        translation: plainText(transcriptParagraphCache.get(transcriptTranslationCacheKey(segment))),
+      })),
+      highlights: Array.isArray(saved) ? saved : [],
+    });
+    const filename = `${sanitizeFilename(currentVideoTitle)}-highlights-llm.txt`;
+    document.getElementById('highlightExportDialog')?.remove();
+    const dialog = document.createElement('dialog');
+    dialog.id = 'highlightExportDialog';
+    dialog.className = 'highlight-export-dialog';
+    dialog.setAttribute('aria-labelledby', 'highlightExportTitle');
+    dialog.innerHTML = `<h2 id="highlightExportTitle">Transcript + highlights</h2>
+      <p>Full original transcript, saved highlights marked with [[double brackets]], and a vocabulary prompt. Search filters do not limit this export.</p>
+      <textarea aria-label="Transcript and highlights export" readonly></textarea>
+      <div class="highlight-export-actions"><button class="enhance-btn" id="copyHighlightExportBtn" type="button">Copy for LLM</button><button class="enhance-btn" data-download type="button">Download .txt</button><button class="enhance-btn" data-close type="button">Close</button></div>
+      <p class="highlight-export-status" role="status"></p>`;
+    dialog.querySelector('textarea').value = text;
+    dialog.querySelector('#copyHighlightExportBtn').onclick = async () => {
+      const success = await copyToClipboard(text);
+      dialog.querySelector('[role="status"]').textContent = success ? 'Copied — paste into your LLM.' : 'Copy failed. Select the preview text to copy, or download the file.';
+    };
+    dialog.querySelector('[data-download]').onclick = () => downloadTextFile(text, filename);
+    dialog.querySelector('[data-close]').onclick = () => dialog.close();
+    dialog.addEventListener('close', () => dialog.remove());
+    document.body.appendChild(dialog);
+    dialog.showModal();
+  } catch (error) {
+    button.textContent = 'Export failed — retry';
+    console.error('Highlight export failed:', error);
+  } finally { button.disabled = false; }
+}
+
 function exportTranscript() {
   const transcriptContent = getDisplayedTranscriptText();
-  const videoUrl = `https://youtube.com/watch?v=${currentVideoId}`;
+  const videoUrl = currentVideoUrl || `https://youtube.com/watch?v=${currentVideoId}`;
 
   let exportText = "";
   exportText += `TRANSCRIPT\n`;
@@ -1465,6 +2185,14 @@ function switchTab(tabName) {
     stopPlaybackTracking();
   }
 
+  if (tabName === "vocabulary") {
+    renderVocabulary();
+    requestAnimationFrame(() => {
+      const contentArea = document.getElementById("contentArea");
+      if (contentArea && document.querySelector('.tab-panel[data-panel="vocabulary"].active')) contentArea.scrollTop = 0;
+    });
+  }
+
   // Saved notes are stored newest first. Open Notes at the top so the note the
   // user just created is the first item they see.
   if (tabName === "notes") {
@@ -1507,6 +2235,8 @@ async function triggerAnalysis() {
   if (!currentTranscriptTimestamped || isAnalysisLoading || currentAnalysis)
     return;
 
+  const generation = digestGeneration;
+  const videoId = currentVideoId;
   isAnalysisLoading = true;
 
   // Show loading indicators in the Overview tab
@@ -1528,7 +2258,9 @@ async function triggerAnalysis() {
       channelName: currentChannelName,
       videoDescription: currentVideoDescription,
       videoDuration: currentVideoDuration,
+      contentSource: currentTranscriptSource,
     });
+    if (generation !== digestGeneration || videoId !== currentVideoId) return;
 
     if (!analysisResult.success) {
       if (chapterList)
@@ -1542,21 +2274,88 @@ async function triggerAnalysis() {
     highlightMomentsOnPage(currentAnalysis.keyMoments);
 
     // Save to cache now that we have analysis
-    await saveToCache(currentVideoId);
+    await saveToCache(videoId);
   } catch (error) {
+    if (generation !== digestGeneration || videoId !== currentVideoId) return;
     console.error("[YouTube Digest Panel] Analysis error:", error);
     if (chapterList)
       chapterList.innerHTML = `<li class="chapter-item" style="color: var(--accent); border: none;">Error: ${escapeHtml(error.message)}</li>`;
   }
 
-  isAnalysisLoading = false;
+  if (generation === digestGeneration && videoId === currentVideoId) {
+    isAnalysisLoading = false;
+  }
 }
 
 // ============================================================
 // TIMESTAMP / SEEK
 // ============================================================
 
+function adjacentSentenceStart(starts, currentTime, direction) {
+  if (!Array.isArray(starts) || !starts.length || !Number.isFinite(currentTime)) {
+    return null;
+  }
+
+  const ordered = [...new Set(starts.filter(Number.isFinite))].sort(
+    (a, b) => a - b,
+  );
+  if (!ordered.length) return null;
+
+  let currentIndex = -1;
+  for (let index = 0; index < ordered.length; index += 1) {
+    if (ordered[index] <= currentTime + 0.05) currentIndex = index;
+    else break;
+  }
+
+  const targetIndex = direction === "previous"
+    ? currentIndex - 1
+    : direction === "next"
+      ? currentIndex + 1
+      : -1;
+  return targetIndex >= 0 && targetIndex < ordered.length
+    ? ordered[targetIndex]
+    : null;
+}
+
+async function navigateTranscriptSentence(direction, videoId) {
+  const tabId = youtubeTabId;
+  const generation = digestGeneration;
+  if (!videoId || videoId !== currentVideoId || !tabId || !currentTranscript?.length) {
+    return { success: false, error: "Transcript unavailable" };
+  }
+
+  // The display groups short sentences together; navigation keeps each
+  // punctuation-delimited sentence as its own jump point.
+  const starts = groupTranscriptEntries(currentTranscript, {
+    ...TRANSCRIPT_SEGMENT_LIMITS,
+    minChars: 0,
+    idealChars: Infinity,
+  }).map((entry) => entry.start);
+  const playback = await chrome.tabs.sendMessage(tabId, { action: "getCurrentTime" });
+  if (
+    videoId !== currentVideoId ||
+    tabId !== youtubeTabId ||
+    generation !== digestGeneration ||
+    playback?.videoId !== videoId
+  ) {
+    return { success: false, error: "Video changed" };
+  }
+
+  const seconds = adjacentSentenceStart(starts, playback.currentTime, direction);
+  if (seconds === null) return { success: false, error: "No adjacent sentence" };
+
+  const result = await chrome.tabs.sendMessage(tabId, {
+    action: "seekTo",
+    seconds,
+    videoId,
+  });
+  return result?.success
+    ? { success: true, seconds }
+    : { success: false, error: result?.error || "Could not seek video" };
+}
+
 async function seekTo(seconds) {
+  if (currentTranscriptSource === "academy-lesson-text") return;
   debugLog("[YouTube Digest Panel] seekTo called with:", seconds);
   if (seconds === undefined || seconds === null) {
     debugLog("[YouTube Digest Panel] seekTo aborted - no seconds value");
@@ -1566,13 +2365,15 @@ async function seekTo(seconds) {
   const payload = {
     action: "seekTo",
     seconds: Number(seconds),
+    videoId: currentVideoId,
   };
 
   try {
     // Try direct messaging to the stored YouTube tab first (fastest/reliable)
     if (youtubeTabId) {
       try {
-        await chrome.tabs.sendMessage(youtubeTabId, payload);
+        const response = await chrome.tabs.sendMessage(youtubeTabId, payload);
+        if (!response?.success) throw new Error(response?.error || "Could not seek video");
         debugLog("[YouTube Digest Panel] seekTo direct success");
         return;
       } catch (directErr) {
@@ -1586,6 +2387,8 @@ async function seekTo(seconds) {
     // Fallback: route through background script
     const result = await chrome.runtime.sendMessage({
       action: "relayToContent",
+      tabId: youtubeTabId,
+      videoId: currentVideoId,
       payload,
     });
     debugLog("[YouTube Digest Panel] seekTo relay result:", result);
@@ -1617,6 +2420,8 @@ async function highlightMomentsOnPage(moments) {
     // Route through background script for reliable message passing
     await chrome.runtime.sendMessage({
       action: "relayToContent",
+      tabId: youtubeTabId,
+      videoId: currentVideoId,
       payload: {
         action: "highlightMoments",
         moments: moments,
@@ -1724,23 +2529,26 @@ function setupExplainFeature() {
   const existingTooltip = document.getElementById("explainTooltip");
   if (existingTooltip) existingTooltip.remove();
 
-  // Create one small toolbar for actions on the selected transcript text.
+  // Keep selection state for the W shortcut without displaying a popup.
   const tooltip = document.createElement("div");
   tooltip.id = "explainTooltip";
+  tooltip.hidden = true;
   tooltip.className = "explain-tooltip";
   tooltip.setAttribute("role", "toolbar");
   tooltip.setAttribute("aria-label", "Selected transcript actions");
   tooltip.innerHTML = `
     <button class="explain-btn" type="button">Explain</button>
-    <button class="selection-note-btn" type="button">Note</button>
+    <button class="selection-note-btn" type="button">Highlight</button>
+    <button class="selection-vocabulary-btn" type="button" title="Save word or phrase (W)">Save</button>
   `;
   tooltip.style.display = "none";
   document.body.appendChild(tooltip);
 
   let selectedText = "";
   let selectedTimestamp = 0;
+  let selectedContext = "";
 
-  // Interacting with either action must preserve the transcript selection and
+  // Interacting with the toolbar must preserve the transcript selection and
   // stay isolated from document and row click behavior.
   tooltip.addEventListener("mousedown", (event) => {
     event.preventDefault();
@@ -1753,10 +2561,7 @@ function setupExplainFeature() {
     event.stopPropagation();
   });
 
-  // Listen for text selection
-  document.addEventListener(
-    "mouseup",
-    () => {
+  const showSelectedTranscriptActions = () => {
       const selection = window.getSelection();
       const text = selection?.toString().trim() || "";
       const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
@@ -1779,6 +2584,10 @@ function setupExplainFeature() {
         const selectedRow = startElement?.closest(".transcript-entry");
         const rowSeconds = Number(selectedRow?.dataset.seconds);
         selectedTimestamp = Number.isFinite(rowSeconds) ? rowSeconds : 0;
+        selectedContext = selectedRow?.dataset.originalText || selectedRow
+          ?.querySelector(".transcript-original, .transcript-text, .transcript-copy")
+          ?.textContent?.replace(/\s+/g, " ")
+          .trim() || "";
 
         // Set the final coordinates while the toolbar is still hidden. If it
         // becomes visible first, Chrome paints it at its default left edge for
@@ -1787,12 +2596,35 @@ function setupExplainFeature() {
         tooltip.style.top = `${rect.bottom + window.scrollY + 8}px`;
         tooltip.style.left = `${rect.left + rect.width / 2}px`;
         tooltip.style.display = "flex";
+        if (window.digestHighlighter?.enabled) tooltip.style.display = "none";
       } else {
         tooltip.style.display = "none";
       }
-    },
-    { signal: selectionSignal },
-  );
+  };
+  document.addEventListener("mouseup", showSelectedTranscriptActions, {signal:selectionSignal});
+  transcriptList.addEventListener("click", event=>{
+    if (event.target.closest('button, .transcript-time') || hasNonCollapsedTextSelection()) return;
+    const selection=window.getSelection();
+    if (!selection) return;
+    const range=document.createRange();
+    const mark=event.target.closest('mark.vocabulary-highlight, mark.user-highlight');
+    if (mark) range.selectNodeContents(mark);
+    else {
+      const caret=document.caretPositionFromPoint?.(event.clientX,event.clientY);
+      const point=caret ? {startContainer:caret.offsetNode,startOffset:caret.offset} : document.caretRangeFromPoint?.(event.clientX,event.clientY);
+      if (!point || point.startContainer.nodeType !== Node.TEXT_NODE || !transcriptList.contains(point.startContainer)) return;
+      const bounds=transcriptWordBounds(point.startContainer.textContent,point.startOffset);
+      if(!bounds) return;
+      range.setStart(point.startContainer,bounds.start);
+      range.setEnd(point.startContainer,bounds.end);
+    }
+    selection.removeAllRanges();
+    selection.addRange(range);
+    document.getElementById('vocabularyMeaningTooltip')?.remove();
+    showSelectedTranscriptActions();
+    event.stopPropagation();
+  },{signal:selectionSignal});
+  void loadManualTranscriptHighlights();
 
   // Hide tooltip when clicking elsewhere
   document.addEventListener(
@@ -1817,50 +2649,110 @@ function setupExplainFeature() {
       await showExplanation(selectedText);
     });
 
-  // Save the exact selected words at the first selected transcript row. This
-  // action does not move playback and does not ask the AI to rewrite the text.
-  tooltip
-    .querySelector(".selection-note-btn")
-    .addEventListener("click", async (event) => {
+  tooltip.querySelector(".selection-note-btn").addEventListener("click", async event=>{
+    event.preventDefault();
+    event.stopPropagation();
+    if (!selectedText || !currentVideoId) return;
+    const videoId=currentVideoId;
+    const key=`ytd_manual_highlights:${videoId}`;
+    const button=event.currentTarget;
+    button.disabled=true;
+    try {
+      const saved=(await chrome.storage.local.get(key))[key] || [];
+      if (!saved.some(item=>item.term === selectedText && item.start === selectedTimestamp)) saved.push({term:selectedText,start:selectedTimestamp});
+      await chrome.storage.local.set({[key]:saved});
+      if(videoId === currentVideoId) {
+        manualTranscriptHighlights=saved;
+        refreshVocabularyHighlights();
+        dismissSelectionActions(true);
+      }
+    } catch(error) { console.error('[YouTube Digest] Highlight:',error); }
+    finally {button.disabled=false;}
+  });
+
+  const vocabularyButton = tooltip.querySelector(".selection-vocabulary-btn");
+  const saveSelectedVocabulary = async () => {
+    if (!selectedText || vocabularyButton.disabled) return;
+
+    const button = vocabularyButton;
+    const originalText = button.textContent;
+    button.textContent = "Saving...";
+    button.disabled = true;
+
+    try {
+      const timestampSeconds = Math.max(0, Number(selectedTimestamp) || 0);
+      const result = await chrome.runtime.sendMessage({
+        action: "saveVocabulary",
+        entry: {
+          term: selectedText,
+          context: selectedContext,
+          videoId: currentVideoId,
+          videoTitle: currentVideoTitle,
+          timestampSeconds,
+          timestampedUrl: (currentVideoId?.startsWith("academy:") || currentVideoId?.startsWith("descript:"))
+            ? currentVideoUrl
+            : currentVideoId
+            ? `https://www.youtube.com/watch?v=${currentVideoId}&t=${Math.floor(timestampSeconds)}s`
+            : "",
+        },
+      });
+      if (!result?.success) {
+        throw new Error(result?.error || "Could not save vocabulary");
+      }
+
+      await loadVocabulary();
+      button.textContent = result.alreadySaved ? "Already saved" : "Saved";
+      setTimeout(() => {
+        tooltip.style.display = "none";
+        button.textContent = originalText;
+        button.disabled = false;
+        dismissSelectionActions(true);
+      }, 900);
+    } catch (error) {
+      console.error("[YouTube Digest] Save vocabulary error:", error);
+      button.textContent = "Error";
+      setTimeout(() => {
+        button.textContent = originalText;
+        button.disabled = false;
+      }, 1500);
+    }
+  };
+
+  vocabularyButton.addEventListener("click", async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    await saveSelectedVocabulary();
+  });
+
+  // W is deliberately scoped to a visible transcript selection. It never
+  // runs while the user is typing in search, a form field, or editable text.
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      const isPlainW =
+        event.key?.toLocaleLowerCase() === "w" &&
+        !event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        !event.shiftKey;
+      const isEditing = Boolean(
+        event.target?.closest?.("input, textarea, select, [contenteditable='true']"),
+      );
+      if (
+        !isPlainW ||
+        event.repeat ||
+        isEditing ||
+        tooltip.style.display === "none" ||
+        !selectedText
+      ) {
+        return;
+      }
       event.preventDefault();
       event.stopPropagation();
-      if (!selectedText || !currentVideoId) return;
-
-      const button = event.currentTarget;
-      const originalText = button.textContent;
-      button.textContent = "Saving...";
-      button.disabled = true;
-
-      try {
-        const result = await chrome.runtime.sendMessage({
-          action: "saveNote",
-          videoId: currentVideoId,
-          timestamp: selectedTimestamp,
-          videoTitle: currentVideoTitle,
-          channelName: currentChannelName,
-          selectedText,
-        });
-
-        if (!result?.success) {
-          throw new Error(result?.error || "Could not save note");
-        }
-
-        button.textContent = "Saved";
-        loadNotes(currentVideoId);
-        setTimeout(() => {
-          tooltip.style.display = "none";
-          button.textContent = originalText;
-          button.disabled = false;
-        }, 900);
-      } catch (error) {
-        console.error("[YouTube Digest] Save selected note error:", error);
-        button.textContent = "Error";
-        setTimeout(() => {
-          button.textContent = originalText;
-          button.disabled = false;
-        }, 1500);
-      }
-    });
+      void saveSelectedVocabulary();
+    },
+    { signal: selectionSignal },
+  );
 }
 
 /**
@@ -1941,6 +2833,18 @@ function getTranscriptContext(selectedText) {
 // CACHING
 // ============================================================
 
+// Tie cached analysis to the exact transcript sent to the model. Older cache
+// entries have no signature, so their Overview is regenerated on demand.
+function transcriptSignature(transcript) {
+  if (!transcript) return null;
+  let hash = 2166136261;
+  for (let i = 0; i < transcript.length; i += 1) {
+    hash ^= transcript.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${transcript.length}:${hash >>> 0}`;
+}
+
 /**
  * Saves the current digest results to persistent local storage.
  * Results survive browser restarts — reopening the same video loads from cache
@@ -1948,7 +2852,7 @@ function getTranscriptContext(selectedText) {
  * Cache expires after 30 days. Oldest entries evicted when > 20 videos cached.
  */
 async function saveToCache(videoId) {
-  if (!videoId || !currentTranscript) return;
+  if (!videoId || videoId !== currentVideoId || !currentTranscript) return;
 
   try {
     // Persist semantic-segment translations for this video.
@@ -1966,11 +2870,18 @@ async function saveToCache(videoId) {
     }
 
     const cacheData = {
+      videoId,
+      transcriptCacheVersion: TRANSCRIPT_CACHE_VERSION,
       analysis: currentAnalysis, // May be null if not yet analyzed
+      analysisSignature: currentAnalysis
+        ? transcriptSignature(currentTranscriptTimestamped)
+        : null,
       transcript: currentTranscript,
       transcriptText: currentTranscriptText,
       transcriptTimestamped: currentTranscriptTimestamped,
       transcriptLanguage: currentTranscriptLanguage,
+      transcriptSourceKey: currentTranscriptSourceKey,
+      transcriptSource: currentTranscriptSource,
       videoTitle: currentVideoTitle,
       channelName: currentChannelName,
       paragraphCache: paragraphCacheForVideo,
@@ -2038,7 +2949,7 @@ async function evictOldCacheEntries(maxEntries) {
  * Loads digest results from persistent local storage.
  * Returns null if not cached or expired (30-day expiry).
  */
-async function loadFromCache(videoId) {
+async function loadFromCache(videoId, sourceKey = null) {
   if (!videoId) return null;
 
   try {
@@ -2046,6 +2957,21 @@ async function loadFromCache(videoId) {
     const cached = result[`digest_${videoId}`];
 
     if (!cached) return null;
+
+    // Entries written before video identity checks may contain another
+    // video's transcript after a navigation race. Refetch them once.
+    if (cached.videoId !== videoId) {
+      await chrome.storage.local.remove(`digest_${videoId}`);
+      return null;
+    }
+
+    // Older entries may contain Supadata's silent non-English fallback.
+    // Refetch once so the source language can be checked before display.
+    if (cached.transcriptCacheVersion !== TRANSCRIPT_CACHE_VERSION ||
+        (cached.transcriptSourceKey || null) !== sourceKey) {
+      await chrome.storage.local.remove(`digest_${videoId}`);
+      return null;
+    }
 
     // Cache expires after 30 days
     const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1000;
@@ -2218,18 +3144,352 @@ async function deleteNote(noteId) {
 }
 
 // ============================================================
+// VOCABULARY NOTEBOOK
+// ============================================================
+
+function setupVocabularyControls() {
+  const auto = document.getElementById("vocabularyAuto");
+  if (!auto) return;
+  document.getElementById("openVocabularyNotebook")?.addEventListener("click", () => switchTab("vocabulary"));
+  chrome.storage.onChanged?.addListener((changes, area) => {
+    if (area === "local" && changes.ytd_vocabulary) void loadVocabulary();
+  });
+  auto.addEventListener("change", async () => {
+    vocabularyAutoEnabled = auto.checked;
+    await chrome.storage.local.set({ ytd_vocabulary_auto: auto.checked });
+    if (auto.checked) void autoCollectVocabulary(true);
+    else setVocabularyCollectionStatus("Automatic word selection is off. Enable it in Vocabulary.");
+  });
+  for (const [id, scope] of [["vocabularyFilterThis", "video"], ["vocabularyFilterAll", "all"]]) {
+    document.getElementById(id)?.addEventListener("click", () => {
+      vocabularyScope = scope;
+      renderVocabulary();
+    });
+  }
+  document.getElementById("vocabularyScan").addEventListener("click", () => void autoCollectVocabulary(true));
+  for (const [id, kind] of [["vocabularyAllTerms", "all"], ["vocabularyWords", "word"], ["vocabularyPhrases", "phrase"]]) {
+    document.getElementById(id).addEventListener("click", () => {
+      vocabularyNotebook = kind;
+      document.getElementById("vocabularyAllTerms").setAttribute("aria-pressed", String(kind === "all"));
+      document.getElementById("vocabularyWords").setAttribute("aria-pressed", String(kind === "word"));
+      document.getElementById("vocabularyPhrases").setAttribute("aria-pressed", String(kind === "phrase"));
+      renderVocabulary();
+    });
+  }
+  for (const id of ["vocabularySearch", "vocabularyShowMastered", "vocabularyRecommendedOnly"]) document.getElementById(id).addEventListener("input", renderVocabulary);
+  document.getElementById("vocabularyExport").addEventListener("click", exportVocabularyNotebooks);
+  document.getElementById("vocabularyPrevious")?.addEventListener("click", () => navigateVocabulary(-1));
+  document.getElementById("vocabularyNext")?.addEventListener("click", () => navigateVocabulary(1));
+
+}
+
+function setVocabularyCollectionStatus(text) {
+  for (const id of ["vocabularyStatus", "transcriptVocabularyStatus"]) {
+    const node = document.getElementById(id);
+    if (node) node.textContent = text;
+  }
+}
+
+async function autoCollectVocabulary(manual = false) {
+  const status = document.getElementById("vocabularyStatus");
+  if (!status) return;
+  let preference;
+  try { preference = await chrome.storage.local.get("ytd_vocabulary_auto"); }
+  catch { setVocabularyCollectionStatus("Could not read notebook settings. Reopen the panel to retry."); return; }
+  vocabularyAutoEnabled = preference.ytd_vocabulary_auto !== false;
+  const checkbox = document.getElementById("vocabularyAuto");
+  if (checkbox) checkbox.checked = vocabularyAutoEnabled;
+  if (!manual && !vocabularyAutoEnabled) {
+    setVocabularyCollectionStatus("Automatic word selection is off. Enable it in Vocabulary.");
+    return;
+  }
+  if (!currentVideoId || !currentTranscript?.length) { if (manual) setVocabularyCollectionStatus("Load an English transcript first."); return; }
+  const segments = groupTranscriptEntries(currentTranscript).map(({ text, start }) => ({ text, start }));
+  const id = currentVideoId;
+  const signature = `${id}:${transcriptSignature(JSON.stringify(segments))}:${transcriptSignature(JSON.stringify(YTD_VOCABULARY_LEARNING.profile(currentVocabulary)))}`;
+  if (vocabularyPanelJobs.has(signature) || (!manual && vocabularyLastAttempt === signature)) return;
+  vocabularyLastAttempt = signature;
+  vocabularyPanelJobs.add(signature);
+  setVocabularyCollectionStatus("Choosing useful vocabulary for your level and mastery history…");
+  try {
+    const result = await chrome.runtime.sendMessage({ action: "extractVocabulary", videoId: id, videoTitle: currentVideoTitle, videoUrl: currentVideoUrl, segments });
+    if (!result?.success) throw new Error(result?.error || "Scan failed. Retry the transcript.");
+    if (result.profileStale) scheduleVocabularyLearning();
+    if (id === currentVideoId) setVocabularyCollectionStatus(result.added ? `Automatically saved ${result.added} new words / phrases. Open notebooks to review.` : "Recommendations updated using your mastery history.");
+  } catch (error) {
+    if (id === currentVideoId) setVocabularyCollectionStatus(`${error.message} Use Update recommendations in Review options to retry.`);
+  } finally {
+    // Keep failed automatic scans from repeatedly charging on each rerender.
+    await loadVocabulary();
+    vocabularyPanelJobs.delete(signature);
+  }
+}
+
+// Group quick mastery clicks into one update instead of one AI scan per card.
+function scheduleVocabularyLearning() {
+  clearTimeout(vocabularyLearningTimer);
+  const videoId = currentVideoId;
+  vocabularyLearningTimer = setTimeout(() => {
+    if (videoId !== currentVideoId || !vocabularyAutoEnabled) return;
+    if (vocabularyPanelJobs.size) { scheduleVocabularyLearning(); return; }
+    void autoCollectVocabulary();
+  }, 2000);
+}
+
+// Older notebooks only retained the first source. Reconstruct a current-video
+// occurrence from the transcript when a word was collected in several videos.
+function vocabularyForVideo(entries, videoId, segments = [], videoTitle = "", videoUrl = "") {
+  if (!videoId) return [];
+  return entries.flatMap(entry => {
+    const occurrence = entry.occurrences?.find(source => source.videoId === videoId);
+    const saved = occurrence ? { ...entry, ...occurrence } : entry.videoId === videoId ? entry : null;
+    if (saved) {
+      if (!segments.length) return [saved];
+      const grounded = YTD_VOCABULARY_CONTEXT.locate(entry.term, segments, saved);
+      return [{ ...saved, ...(grounded ? { ...grounded,
+        timestampedUrl: videoId.startsWith("academy:") || videoId.startsWith("descript:")
+          ? saved.timestampedUrl : `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&t=${Math.floor(grounded.timestampSeconds)}s`,
+      } : { context: "", timestampedUrl: "", videoTitle: "" }) }];
+    }
+    const grounded = YTD_VOCABULARY_CONTEXT.locate(entry.term, segments);
+    if (!grounded) return [];
+    const seconds = grounded.timestampSeconds;
+    return [{ ...entry, videoId, videoTitle, ...grounded,
+      timestampSeconds: seconds,
+      timestampedUrl: videoId.startsWith("academy:") || videoId.startsWith("descript:")
+        ? videoUrl : `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&t=${Math.floor(seconds)}s` }];
+  }).sort((a, b) => {
+    const time = entry => Number.isFinite(Number(entry.timestampSeconds))
+      ? Math.max(0, Number(entry.timestampSeconds)) : Infinity;
+    const difference = time(a) - time(b);
+    if (difference && !Number.isNaN(difference)) return difference;
+    // Terms in the same caption follow their order within the sentence.
+    const position = entry => findVocabularyMatches(entry.context || "", [entry])[0]?.start ?? Infinity;
+    const offset = position(a) - position(b);
+    return Number.isNaN(offset) ? 0 : offset;
+  });
+}
+
+function scopedVocabulary() {
+  if (vocabularyScope === "all") {
+    const corrected = new Map(vocabularyForVideo(currentVocabulary, currentVideoId,
+      groupTranscriptEntries(currentTranscript || []), currentVideoTitle, currentVideoUrl).map(entry => [entry.id, entry]));
+    return currentVocabulary.map(entry => entry.videoId === currentVideoId ? corrected.get(entry.id) || entry : entry);
+  }
+  return vocabularyForVideo(
+    currentVocabulary, currentVideoId, groupTranscriptEntries(currentTranscript || []), currentVideoTitle, currentVideoUrl);
+}
+
+function exportVocabularyNotebooks() {
+  const safe = value => String(value || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  for (const [kind, title] of [["word", "Word notebook"], ["phrase", "Phrase notebook"]]) {
+    const entries = scopedVocabulary().filter(entry => (/\s/.test(entry.term.trim()) ? "phrase" : "word") === kind);
+    const text = `# ${title}\n\nScope: ${safe(vocabularyScope === "all" ? "All videos" : currentVideoTitle || "This video")} · English level: IELTS 7.0 · ${entries.length} entries\n\n## Contents\n\n- [Entries](#entries)\n\n<a id="entries"></a>\n## Entries\n\n` + entries.map(entry =>
+      `### ${safe(entry.term)}\n\nAmerican IPA (AI generated): ${safe(entry.ipa)}\n\n${safe(entry.meaningEn)}\n\n${safe(entry.meaningZh)}\n\nUsage: ${safe(entry.usage)}\n\nOriginal sentence: ${safe(entry.context)}\n\nSource: ${safe(entry.timestampedUrl)}\n\nStatus: ${entry.mastered ? "Mastered" : "Learning"} · Encounters: ${entry.seenCount || 1}\n`).join("\n");
+    downloadTextFile(text, `ielts-7-${vocabularyScope}-${kind}-notebook.md`);
+  }
+}
+
+async function loadVocabulary() {
+  try {
+    const result = await chrome.runtime.sendMessage({ action: "getVocabulary" });
+    if (!result?.success) return;
+    currentVocabulary = Array.isArray(result.entries) ? result.entries : [];
+    renderVocabulary();
+    refreshVocabularyHighlights();
+  } catch (error) {
+    console.error("[YouTube Digest Panel] Vocabulary load error:", error);
+  }
+}
+
+function playVocabularyEntry(entry) {
+  if (entry.videoId && entry.videoId === currentVideoId) {
+    switchTab("transcript");
+    seekTo(entry.timestampSeconds);
+  } else if (entry.timestampedUrl) {
+    chrome.tabs.create({ url: entry.timestampedUrl });
+  }
+}
+
+function renderVocabularyOriginal(entry) {
+  const source = String(entry.context || "");
+  const matches = findVocabularyMatches(source, [entry]);
+  let cursor = 0, html = "";
+  for (const match of matches) {
+    html += escapeHtml(source.slice(cursor, match.start)) + `<mark>${escapeHtml(source.slice(match.start, match.end))}</mark>`;
+    cursor = match.end;
+  }
+  return html + escapeHtml(source.slice(cursor));
+}
+
+function formatVocabularyTimestamp(totalSeconds) {
+  const safeSeconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const minutes = Math.floor(safeSeconds / 60);
+  const seconds = safeSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function updateVocabularyNavigation() {
+  const items = Array.from(document.getElementById("vocabularyList")?.querySelectorAll(".vocabulary-item") || []);
+  let index = items.findIndex(item => item.dataset.entryId === vocabularyReviewId);
+  if (index < 0 && items.length) {
+    index = 0;
+    vocabularyReviewId = items[0].dataset.entryId;
+  }
+  items.forEach((item, position) => {
+    item.hidden = position !== index;
+    item.classList.toggle("vocabulary-current", position === index);
+    if (position === index) item.setAttribute("aria-current", "true");
+    else item.removeAttribute("aria-current");
+  });
+  const previous = document.getElementById("vocabularyPrevious");
+  const next = document.getElementById("vocabularyNext");
+  const position = document.getElementById("vocabularyPosition");
+  if (previous) previous.disabled = index <= 0;
+  if (next) next.disabled = index < 0 || index >= items.length - 1;
+  if (position) position.textContent = items.length ? `${index + 1} / ${items.length}` : "0 / 0";
+  return { items, index };
+}
+
+function navigateVocabulary(direction, animate = true) {
+  const { items, index } = updateVocabularyNavigation();
+  const target = items[index + direction];
+  if (!target) return false;
+  vocabularyReviewId = target.dataset.entryId;
+  updateVocabularyNavigation();
+  if (animate && direction && !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+    target.getAnimations?.().forEach(animation => animation.cancel());
+    target.animate?.([
+      { opacity: 0.4, transform: `perspective(900px) translateX(${direction * 24}px) rotateY(${direction * 8}deg)` },
+      { opacity: 1, transform: "perspective(900px) translateX(0) rotateY(0deg)" },
+    ], { duration: 160, easing: "cubic-bezier(0.23, 1, 0.32, 1)" });
+  }
+  return true;
+}
+
+function handleVocabularyShortcut(event) {
+  if ((event.key !== "ArrowLeft" && event.key !== "ArrowRight") ||
+      event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.repeat ||
+      !resultTabIsActive("vocabulary") ||
+      event.target?.closest?.("input, textarea, select, [contenteditable], [role='textbox']")) return;
+  event.preventDefault();
+  event.stopPropagation();
+  navigateVocabulary(event.key === "ArrowLeft" ? -1 : 1, false);
+}
+
+function renderVocabulary() {
+  const list = document.getElementById("vocabularyList");
+  const intro = document.getElementById("vocabularyIntro");
+  const count = document.getElementById("vocabularyCount");
+  if (!list) return;
+
+  const scopedEntries = scopedVocabulary();
+  document.getElementById("vocabularyFilterThis")?.setAttribute("aria-pressed", String(vocabularyScope === "video"));
+  document.getElementById("vocabularyFilterAll")?.setAttribute("aria-pressed", String(vocabularyScope === "all"));
+  const description = document.getElementById("vocabularyScopeDescription");
+  if (description) description.textContent = vocabularyScope === "video"
+    ? "One card at a time. Use the left and right arrow keys."
+    : "Your vocabulary and phrases collected across all videos.";
+  const previousItems = Array.from(list.querySelectorAll(".vocabulary-item"));
+  const previousIndex = previousItems.findIndex(item => item.dataset.entryId === vocabularyReviewId);
+  list.innerHTML = "";
+  if (count) {
+    count.textContent = scopedEntries.length
+      ? `${scopedEntries.length} saved`
+      : "";
+  }
+  if (!scopedEntries.length) {
+    if (intro) intro.style.display = "block";
+    list.textContent = vocabularyScope === "video"
+      ? "No vocabulary saved for this video yet. Scan its transcript or save a word or phrase with W."
+      : "Your vocabulary collection is empty. Scan a transcript or save a word or phrase with W.";
+    updateVocabularyNavigation();
+    return;
+  }
+  if (intro) intro.style.display = "none";
+
+  const query = document.getElementById("vocabularySearch")?.value.trim().toLocaleLowerCase() || "";
+  const showMastered = document.getElementById("vocabularyShowMastered")?.checked;
+  const recommendationsOnly = document.getElementById("vocabularyRecommendedOnly")?.checked !== false;
+  const learner = document.getElementById("vocabularyLearnerStatus");
+  if (learner) {
+    const known = currentVocabulary.filter(entry => entry.mastered).length;
+    learner.textContent = `IELTS 7 starting level · ${known} marked mastered. Each mark helps refine your next recommendations.`;
+  }
+  let entries = scopedEntries.filter(entry =>
+    (vocabularyNotebook === "all" || (/\s/.test(entry.term.trim()) ? "phrase" : "word") === vocabularyNotebook) &&
+    (showMastered || !entry.mastered) &&
+    (!recommendationsOnly || (showMastered && entry.mastered) || YTD_VOCABULARY_LEARNING.recommended(entry)) &&
+    [entry.term, entry.meaningEn, entry.meaningZh].join(" ").toLocaleLowerCase().includes(query));
+  if (recommendationsOnly) entries = YTD_VOCABULARY_LEARNING.rank(entries);
+  if (count) count.textContent = `${entries.length} cards`;
+  const reviewKey = `${currentVideoId}:${vocabularyScope}:${vocabularyNotebook}:${query}:${Boolean(showMastered)}:${recommendationsOnly}`;
+  if (reviewKey !== vocabularyReviewKey) vocabularyReviewId = entries[0]?.id || null;
+  else if (!entries.some(entry => entry.id === vocabularyReviewId)) {
+    vocabularyReviewId = entries[Math.max(0, Math.min(previousIndex, entries.length - 1))]?.id || null;
+  }
+  vocabularyReviewKey = reviewKey;
+  if (!entries.length) list.textContent = "No cards to review. Update recommendations or turn off Recommended only to see saved entries.";
+  entries.forEach((entry) => {
+    const item = document.createElement("article");
+    item.className = "vocabulary-item";
+    item.dataset.entryId = entry.id;
+    item.addEventListener("click", () => {
+      vocabularyReviewId = entry.id;
+      updateVocabularyNavigation();
+    });
+    const timestamp = formatVocabularyTimestamp(entry.timestampSeconds);
+    item.innerHTML = `
+      <div class="vocabulary-item-header">
+        <div class="vocabulary-term-actions">
+          <strong class="vocabulary-term">${escapeHtml(entry.term)}</strong>
+          <button class="vocabulary-mastered" type="button">${entry.mastered ? "Study again" : "Mark mastered"}</button>
+        </div>
+        <button class="vocabulary-delete" type="button" aria-label="Delete ${escapeHtml(entry.term)}" title="Delete word">Delete</button>
+      </div>
+      ${entry.ipa ? `<p class="vocabulary-ipa" lang="en-US">${escapeHtml(entry.ipa)}</p>` : ""}
+      <p class="vocabulary-meaning">${escapeHtml(entry.meaningEn || "Manually saved — scan the transcript for a definition.")}${entry.meaningZh ? `<br>${escapeHtml(entry.meaningZh)}` : ""}</p>
+      ${entry.recommendationReason ? `<p class="vocabulary-reason"><span>Why this word</span>${escapeHtml(entry.recommendationReason)}</p>` : ""}
+      ${entry.usage ? `<p class="vocabulary-context">Usage: ${escapeHtml(entry.usage)}</p>` : ""}
+      ${entry.context ? `<p class="vocabulary-original"><span class="vocabulary-original-label">Original sentence</span><strong>${renderVocabularyOriginal(entry)}</strong></p>` : ""}
+      ${entry.videoTitle ? `<button class="vocabulary-source" type="button" title="Play from saved timestamp"><span>${escapeHtml(timestamp)}</span>${escapeHtml(entry.videoTitle)}</button>` : ""}
+    `;
+
+    item.querySelector(".vocabulary-mastered")?.addEventListener("click", async () => {
+      const result = await chrome.runtime.sendMessage({ action: "setVocabularyMastered", entryId: entry.id, mastered: !entry.mastered });
+      if (result?.success) {
+        await loadVocabulary();
+        setVocabularyCollectionStatus(entry.mastered ? "Added back to practice. Updating recommendations…" : "Marked mastered. Your next recommendations will use this feedback.");
+        scheduleVocabularyLearning();
+      }
+    });
+    item.querySelector(".vocabulary-delete")?.addEventListener("click", async () => {
+      const result = await chrome.runtime.sendMessage({
+        action: "deleteVocabulary",
+        entryId: entry.id,
+      });
+      if (result?.success) await loadVocabulary();
+    });
+    item.querySelector(".vocabulary-source")?.addEventListener("click", () => {
+      playVocabularyEntry(entry);
+    });
+    list.appendChild(item);
+  });
+  updateVocabularyNavigation();
+}
+
+// ============================================================
 // AUTO-SCROLL — Follow video playback in transcript
 // ============================================================
-// While a video plays, the transcript automatically scrolls to show which
-// 30-second chunk is currently being spoken. If the user manually scrolls
-// (e.g., to read ahead), auto-scroll pauses and a "Follow playback" button
-// appears so they can resume it. Highlight always stays active regardless.
+// Normal following pauses on manual scrolling. The explicit Auto-scroll
+// toggle locks following until switched off, including within the same sentence.
 
 /**
  * Starts polling the video's current time and highlighting/scrolling
  * to the matching transcript entry.
  */
 function startPlaybackTracking() {
+  if (currentTranscriptSource === "academy-lesson-text") return;
   if (!currentTranscript || !currentTranscript.length) return;
 
   // Don't restart if already tracking (preserves user's auto-scroll state)
@@ -2237,9 +3497,9 @@ function startPlaybackTracking() {
 
   const willRestoreReadingPosition =
     pendingTranscriptViewState?.videoId === currentVideoId;
-  autoScrollEnabled = !willRestoreReadingPosition;
+  autoScrollEnabled = autoScrollEnabled && !willRestoreReadingPosition;
   document.getElementById("followPlaybackBtn").style.display =
-    willRestoreReadingPosition ? "block" : "none";
+    (autoScrollEnabled || autoScrollLocked) ? "none" : "block";
 
   // Poll video time every 500ms
   autoScrollInterval = setInterval(() => playbackTrackingTick(), 500);
@@ -2248,6 +3508,10 @@ function startPlaybackTracking() {
   const contentArea = document.getElementById("contentArea");
   contentArea.removeEventListener("scroll", onContentAreaScroll);
   contentArea.addEventListener("scroll", onContentAreaScroll);
+  contentArea.removeEventListener("wheel", pausePlaybackFollowing);
+  contentArea.addEventListener("wheel", pausePlaybackFollowing, { passive: true });
+  contentArea.removeEventListener("touchmove", pausePlaybackFollowing);
+  contentArea.addEventListener("touchmove", pausePlaybackFollowing, { passive: true });
 }
 
 /**
@@ -2259,15 +3523,14 @@ function stopPlaybackTracking() {
     clearInterval(autoScrollInterval);
     autoScrollInterval = null;
   }
-  autoScrollEnabled = true; // Reset for next time
   lastAutoScrollTime = 0;
   document.getElementById("followPlaybackBtn").style.display = "none";
 
-  // Remove active highlights
+  // Clear playback progress when leaving this transcript.
   document
-    .querySelectorAll(".transcript-entry.active-playback")
+    .querySelectorAll(".transcript-entry.active-playback, .transcript-entry.playback-read")
     .forEach((el) => {
-      el.classList.remove("active-playback");
+      el.classList.remove("active-playback", "playback-read");
     });
 }
 
@@ -2276,18 +3539,20 @@ function stopPlaybackTracking() {
  * YouTube tab and highlights + scrolls to the matching transcript entry.
  */
 async function playbackTrackingTick() {
+  const tabId = youtubeTabId;
+  const videoId = currentVideoId;
+  const generation = digestGeneration;
+  if (!Number.isInteger(tabId) || !videoId) return;
   try {
     const result = await chrome.runtime.sendMessage({
-      action: "relayToContent",
+      action: "relayToContent", tabId, videoId,
       payload: { action: "getCurrentTime" },
     });
-
-    if (!result.success || !result.response) return;
-
-    const currentTime = result.response.currentTime || 0;
-    highlightActiveEntry(currentTime);
+    if (generation !== digestGeneration || tabId !== youtubeTabId || videoId !== currentVideoId) return;
+    if (!result.success || result.tabId !== tabId || result.response?.videoId !== videoId) return;
+    highlightActiveEntry(result.response.currentTime || 0);
   } catch (error) {
-    // Silently ignore — YouTube tab might be closed or navigated away
+    // The bound tab may have closed or navigated away.
   }
 }
 
@@ -2309,6 +3574,24 @@ function scrollToActiveEntry() {
   return true;
 }
 
+// Keep visible captions still; move a chunk only when playback nears an edge.
+function gentlyFollowEntry(entry) {
+  const content = document.getElementById('contentArea');
+  if (!content || !entry) return;
+  const viewport = content.getBoundingClientRect();
+  const position = entry.getBoundingClientRect();
+  const height = viewport.height;
+  if (height <= 0) return;
+  const above = position.top < viewport.top + 12;
+  const nearBottom = position.top > viewport.bottom - Math.min(100, height * 0.2);
+  if (!above && !nearBottom) return;
+  const now = Date.now();
+  // Let smooth scrolling settle, and avoid chasing every short caption.
+  if (now - lastAutoScrollTime < 4000) return;
+  lastAutoScrollTime = now;
+  content.scrollBy({ top: position.top - (viewport.top + height * 0.3), behavior: 'smooth' });
+}
+
 /**
  * Finds the transcript entry matching the current playback time,
  * highlights it, and scrolls to it (if auto-scroll is enabled).
@@ -2322,34 +3605,32 @@ function highlightActiveEntry(currentSeconds) {
   const entries = transcriptList.querySelectorAll(".transcript-entry");
   if (entries.length === 0) return;
 
-  // Find the entry whose time range contains the current playback time
-  let activeEntry = null;
+  if (!Number.isFinite(currentSeconds)) return;
+
+  // Recompute from playback position so seeking backwards also restores unread text.
+  let activeIndex = -1;
   entries.forEach((entry, index) => {
-    const entrySeconds = parseInt(entry.dataset.seconds);
-    const nextEntry = entries[index + 1];
-    const nextSeconds = nextEntry
-      ? parseInt(nextEntry.dataset.seconds)
+    const start = Number(entry.dataset.seconds);
+    const nextStart = entries[index + 1]
+      ? Number(entries[index + 1].dataset.seconds)
       : Infinity;
-
-    if (currentSeconds >= entrySeconds && currentSeconds < nextSeconds) {
-      activeEntry = entry;
-    }
+    if (currentSeconds >= start && currentSeconds < nextStart) activeIndex = index;
   });
+  const activeEntry = entries[activeIndex];
+  if (activeEntry?.classList.contains("active-playback")) {
+    if (autoScrollLocked) gentlyFollowEntry(activeEntry);
+    return;
+  }
 
+  entries.forEach((entry, index) => {
+    entry.classList.toggle("playback-read", activeIndex >= 0 && index < activeIndex);
+    entry.classList.toggle("active-playback", index === activeIndex);
+  });
+  // Before the first caption, all text returns to its initial unread appearance.
   if (!activeEntry) return;
 
-  // Skip if this entry is already highlighted (no DOM thrashing)
-  if (activeEntry.classList.contains("active-playback")) return;
-
-  // Remove old highlight, add new one
-  entries.forEach((e) => e.classList.remove("active-playback"));
-  activeEntry.classList.add("active-playback");
-
   // Only scroll if auto-scroll is enabled
-  if (autoScrollEnabled) {
-    lastAutoScrollTime = Date.now();
-    activeEntry.scrollIntoView({ behavior: "smooth", block: "center" });
-  }
+  if (autoScrollEnabled || autoScrollLocked) gentlyFollowEntry(activeEntry);
 }
 
 /**
@@ -2364,11 +3645,14 @@ function onContentAreaScroll() {
   // (smooth scroll animations can last longer than a simple boolean flag)
   if (Date.now() - lastAutoScrollTime < 1000) return;
 
-  // User scrolled manually — disable auto-scroll and show the button
-  if (autoScrollEnabled && autoScrollInterval) {
-    autoScrollEnabled = false;
-    document.getElementById("followPlaybackBtn").style.display = "block";
-  }
+  pausePlaybackFollowing();
+}
+
+function pausePlaybackFollowing() {
+  if (autoScrollLocked || !autoScrollEnabled || !autoScrollInterval || !transcriptTabIsActive()) return;
+  autoScrollEnabled = false;
+  document.getElementById("followPlaybackBtn").style.display = "block";
+  scheduleTranscriptViewStateSave();
 }
 
 /**
@@ -2389,6 +3673,7 @@ async function loadTranscriptViewState(videoId) {
       TRANSCRIPT_VIEW_STATE_KEY,
     );
     const state = result?.[TRANSCRIPT_VIEW_STATE_KEY]?.[videoId];
+    if (state?.following !== false) return null;
     const scrollTop = Number(state?.scrollTop);
     if (!Number.isFinite(scrollTop) || scrollTop < 0) return null;
     return { videoId, scrollTop };
@@ -2402,13 +3687,17 @@ async function loadTranscriptViewState(videoId) {
  * Stores positions for a small recent set of videos. This prevents one value
  * from growing without a limit during a long Chrome session.
  */
-async function saveTranscriptViewState(videoId, scrollTop) {
+async function saveTranscriptViewState(
+  videoId,
+  scrollTop,
+  following = autoScrollEnabled,
+) {
   if (!videoId || !Number.isFinite(scrollTop) || scrollTop < 0) return;
   try {
     const storage = getTranscriptViewStateStorage();
     const result = await storage.get(TRANSCRIPT_VIEW_STATE_KEY);
     const states = result?.[TRANSCRIPT_VIEW_STATE_KEY] || {};
-    states[videoId] = { scrollTop, updatedAt: Date.now() };
+    states[videoId] = { scrollTop, following, updatedAt: Date.now() };
 
     const recentStates = Object.fromEntries(
       Object.entries(states)
@@ -2487,7 +3776,7 @@ function restorePendingTranscriptViewState(videoId) {
   const state = pendingTranscriptViewState;
   pendingTranscriptViewState = null;
   const contentArea = document.getElementById("contentArea");
-  if (!state || state.videoId !== videoId) {
+  if (!state || state.videoId !== videoId || autoScrollLocked) {
     contentArea?.classList.remove("restoring-transcript-view");
     return;
   }
@@ -2501,7 +3790,7 @@ function restorePendingTranscriptViewState(videoId) {
     isRestoringTranscriptView = true;
     lastAutoScrollTime = Date.now();
     autoScrollEnabled = false;
-    contentArea.scrollTop = state.scrollTop;
+    if (transcriptTabIsActive()) contentArea.scrollTop = state.scrollTop;
     lastTranscriptScrollTop = state.scrollTop;
     document.getElementById("followPlaybackBtn").style.display = "block";
     contentArea.classList.remove("restoring-transcript-view");
@@ -2516,36 +3805,17 @@ function restorePendingTranscriptViewState(videoId) {
 // ============================================================
 
 async function loadDisplayLanguageMode(videoId) {
-  if (!videoId) {
-    setTranscriptModeButtons("original");
-    return "original";
-  }
+  void videoId;
+  let mode = window.digestReader ? "original" : "bilingual";
   try {
-    const stored = await chrome.storage.local.get(DISPLAY_LANGUAGE_MODE_KEY);
-    const mode = stored?.[DISPLAY_LANGUAGE_MODE_KEY]?.[videoId]?.mode;
-    currentTranscriptMode = DISPLAY_LANGUAGE_MODES.has(mode)
-      ? mode
-      : "original";
-  } catch (error) {
-    currentTranscriptMode = "original";
-  }
-  setTranscriptModeButtons(currentTranscriptMode);
-  return currentTranscriptMode;
-}
-
-async function saveDisplayLanguageMode(videoId, mode) {
-  if (!videoId || !DISPLAY_LANGUAGE_MODES.has(mode)) return;
-  const stored = await chrome.storage.local.get(DISPLAY_LANGUAGE_MODE_KEY);
-  const modes = stored?.[DISPLAY_LANGUAGE_MODE_KEY] || {};
-  modes[videoId] = { mode, updatedAt: Date.now() };
-  const recentModes = Object.fromEntries(
-    Object.entries(modes)
-      .sort(([, a], [, b]) => (b.updatedAt || 0) - (a.updatedAt || 0))
-      .slice(0, 50),
-  );
-  await chrome.storage.local.set({
-    [DISPLAY_LANGUAGE_MODE_KEY]: recentModes,
-  });
+    const key = YTD_SETTINGS.STORAGE_KEY || "ytd_settings";
+    const saved = (await chrome.storage.local.get(key))[key];
+    const choice = window.digestReader ? saved?.defaultReaderMode : saved?.defaultTranscriptMode;
+    if (DISPLAY_LANGUAGE_MODES.has(choice)) mode = choice;
+  } catch (error) { console.error("Could not load reading defaults:", error); }
+  currentTranscriptMode = mode;
+  setTranscriptModeButtons(mode);
+  return mode;
 }
 
 function getActiveTranscriptSegments() {
@@ -2553,7 +3823,7 @@ function getActiveTranscriptSegments() {
 }
 
 function transcriptTranslationCacheKey(segment) {
-  return `${currentVideoId}:zh:semantic:${segment.id}`;
+  return `${currentVideoId}:zh:semantic-v2:${segment.id}:${transcriptSignature(segment.text)}`;
 }
 
 function setTranscriptModeButtons(mode) {
@@ -2569,7 +3839,6 @@ async function handleDisplayLanguageModeChange(mode) {
   if (mode === currentTranscriptMode) return;
 
   currentTranscriptMode = mode;
-  await saveDisplayLanguageMode(currentVideoId, mode);
   if (mode !== "original") interfaceTranslationFailures.clear();
   translationGeneration += 1;
   translationWorkCount = 0;
@@ -2623,10 +3892,12 @@ function renderTranscriptSegmentContent(segment, mode, translated, error) {
 function renderTranscriptModeRows(segments, mode) {
   const transcriptList = document.getElementById("transcriptList");
   if (!transcriptList) return [];
+  transcriptList.classList.toggle("continuous-reading", !transcriptTimestampsVisible && mode !== "bilingual");
   transcriptList.innerHTML = "";
 
   const existingBadge = document.getElementById("transcriptSourceBadge");
   if (existingBadge) existingBadge.remove();
+  renderTranscriptSourceBadge();
 
   const rows = [];
   segments.forEach((segment, index) => {
@@ -2638,20 +3909,23 @@ function renderTranscriptModeRows(segments, mode) {
     div.dataset.seconds = segment.start;
     div.dataset.segmentId = segment.id;
     div.dataset.segmentIndex = index;
+    div.dataset.originalText = segment.text;
 
     const minutes = Math.floor(segment.start / 60);
     const seconds = Math.floor(segment.start % 60);
     const timestamp = `${minutes}:${String(seconds).padStart(2, "0")}`;
     div.innerHTML = `
-      <span class="transcript-time">${timestamp}</span>
+      ${renderTranscriptReplay(segment.start, timestamp)}
       ${renderTranscriptSegmentContent(segment, mode, cached, "")}
     `;
-    div.addEventListener("click", (event) =>
-      seekFromTranscriptEntryClick(event, segment.start),
-    );
+    setupTranscriptReplay(div, segment.start);
     transcriptList.appendChild(div);
     rows.push(div);
   });
+
+  applyVocabularyHighlights(transcriptList);
+
+  void autoCollectVocabulary();
 
   // Bilingual mode can find source text before each translation arrives.
   refreshTranscriptSearch({ preserveIndex: false, scroll: false });
@@ -2707,6 +3981,7 @@ function updateTranslatedRow(segment, index, alignedItem, generation) {
       alignedItem.error,
     );
   }
+  applyVocabularyHighlights(row);
   row.classList.toggle("translated", !!alignedItem.text);
   row.classList.toggle("translating", false);
   row.classList.toggle("translation-failed", !alignedItem.text);
@@ -2895,13 +4170,26 @@ globalThis.__YTD_TRANSCRIPT_TESTING__ = {
   sendTranslationMessage,
   groupTranscriptEntries,
   splitOversizedThought,
+  transcriptTranslationCacheKey,
   alignTranslatedSegmentBatch,
   findLiteralTranscriptMatches,
+  normalizeVocabularyTerm,
+  findVocabularyMatches,
+  vocabularyForVideo,
+  renderVocabularyOriginal,
+  navigateVocabulary,
+  handleVocabularyShortcut,
+  findTranslatedVocabularyMatches,
+  attachVocabularyTooltip,
+  transcriptWordBounds,
+  extractVideoId,
+  setupTranscriptReplay,
   loadTranscriptViewState,
   saveTranscriptViewState,
   loadDisplayLanguageMode,
-  saveDisplayLanguageMode,
+  loadFromCache,
   getNavigationUrl,
   renderSubtitleInlineMarkup,
   renderTranscriptSegmentContent,
+  adjacentSentenceStart,
 };

@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Transcript Reader · YouTube Digest</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+    <link rel="stylesheet" href="highlighter.css" />
+    <link rel="stylesheet" href="reader.css" />
+  </head>
+  <body>
+    <!-- HEADER -->
+    <!-- Note: the panel's own "YouTube Digest" title is shown by Chrome's side-panel
+         title bar, so we don't repeat a logo here. -->
+    <div class="header">
+      <div class="header-top">
+        <!-- Video info -->
+        <div class="video-info" id="videoInfo" style="display: none">
+          <div class="video-title" id="videoTitle"></div>
+          <div class="video-channel" id="videoChannel"></div>
+        </div>
+        <div class="header-actions">
+          <div
+            class="transcript-mode-control global-language-control"
+            id="transcriptModeControl"
+            role="group"
+            aria-label="Content language"
+            style="display: none"
+          >
+            <button
+              class="transcript-mode-btn"
+              type="button"
+              data-transcript-mode="original"
+              aria-pressed="false"
+            >Original</button>
+            <button
+              class="transcript-mode-btn"
+              type="button"
+              data-transcript-mode="zh"
+              aria-pressed="false"
+            >中文</button>
+            <button
+              class="transcript-mode-btn active"
+              type="button"
+              data-transcript-mode="bilingual"
+              aria-pressed="true"
+            >双语</button>
+            <span
+              class="translation-spinner"
+              id="langSpinner"
+              aria-label="Translating"
+            ></span>
+          </div>
+          <button
+            class="settings-btn"
+            id="settingsBtn"
+            type="button"
+            title="Open YouTube Digest settings"
+            aria-label="Open YouTube Digest settings"
+          >
+            Settings
+          </button>
+          <div class="reading-toggle-actions">
+          <div class="highlight-export-pair">
+          <button class="enhance-btn" id="openReaderBtn" type="button" disabled aria-current="page" title="You are in Reader view">Reader</button>
+          <button class="continuous-highlight-btn" id="continuousHighlightBtn"
+            type="button" aria-pressed="true" aria-keyshortcuts="Alt+Q Alt+Shift+H"
+            title="开启连续高亮：划选文字即可保存（Option+Q）"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 3 5 5-12 12-6 1 1-6Z"/><path d="m14 5 5 5M3 21h8"/></svg><span>连续高亮已开启</span></button>
+          <button class="highlight-export-btn" id="exportHighlightsBtn" type="button" title="Copy or download the full transcript with saved highlights for an LLM" aria-label="Export transcript with highlights">↓ <span>Export highlights</span></button>
+          </div>
+          <button class="auto-scroll-toggle" id="autoScrollToggleBtn" type="button"
+            aria-pressed="true" title="Keep following the current sentence, even after manual scrolling">Auto On</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab navigation -->
+      <div class="tabs" id="tabsNav" style="display: none">
+        <button class="tab active" data-tab="transcript">Transcript</button>
+        <button class="tab" data-tab="overview">Overview</button>
+        <button class="tab" data-tab="vocabulary" title="Vocabulary &amp; Phrases">Vocabulary</button>
+        <button class="tab" data-tab="notes">Notes</button>
+        <button class="tab" data-tab="study">Study</button>
+      </div>
+    </div>
+
+    <!-- MAIN CONTENT -->
+    <div class="content" id="contentArea">
+      <!-- WELCOME STATE -->
+      <div id="welcomeState" class="welcome-container">
+        <div class="welcome-icon" aria-hidden="true"></div>
+        <div class="welcome-title">Ready to Digest</div>
+        <div class="welcome-desc">
+          Navigate to a YouTube video or LangChain Academy lesson and click the extension icon to get an
+          AI-powered digest.
+        </div>
+      </div>
+
+      <!-- LOADING STATE -->
+      <div id="loadingState" style="display: none">
+        <div class="loading-container">
+          <div class="loading-bar"></div>
+          <div class="loading-text" id="loadingText">Fetching transcript</div>
+          <div class="loading-subtext" id="loadingSubtext">
+            Extracting captions from video...
+          </div>
+        </div>
+      </div>
+
+      <!-- ERROR STATE -->
+      <div id="errorState" style="display: none">
+        <div class="error-container">
+          <div class="error-icon" aria-hidden="true">!</div>
+          <div class="error-title" id="errorTitle">Error</div>
+          <div class="error-message" id="errorMessage">
+            Something went wrong.
+          </div>
+          <button class="error-btn" id="errorBtn">Try Again</button>
+        </div>
+      </div>
+
+      <!-- RESULTS -->
+      <div id="resultsState" style="display: none">
+        <!-- TAB: Transcript (default - no LLM required) -->
+        <div class="tab-panel active" data-panel="transcript">
+          <div class="section">
+            <div class="section-header transcript-section-header">
+              <div class="section-title">Full Transcript</div>
+              <div class="transcript-actions">
+                <button class="enhance-btn" id="refreshTranscriptBtn" type="button" title="Reload the current caption track and reset this video’s transcript, translations, and overview">↻ Refresh</button>
+                <button class="enhance-btn" id="toggleTranscriptTimestampsBtn" type="button" aria-pressed="false" title="Show timestamps in compact rows">Timestamps</button>
+                <button class="enhance-btn" id="copyTranscriptBtn">Copy</button>
+                <button class="enhance-btn" id="exportTranscriptBtn">
+                  Export
+                </button>
+              </div>
+            </div>
+            <!-- Search stays inside the Transcript tab and never changes playback. -->
+            <div class="transcript-search" role="search">
+              <svg
+                class="transcript-search-icon"
+                viewBox="0 0 20 20"
+                aria-hidden="true"
+              >
+                <circle cx="8.5" cy="8.5" r="5.5"></circle>
+                <path d="m12.5 12.5 4 4"></path>
+              </svg>
+              <input
+                class="transcript-search-input"
+                id="transcriptSearchInput"
+                type="search"
+                placeholder="Search words or phrases"
+                aria-label="Search transcript"
+                aria-controls="transcriptList"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <button
+                class="transcript-search-clear"
+                id="transcriptSearchClearBtn"
+                type="button"
+                aria-label="Clear transcript search"
+                title="Clear search"
+                hidden
+              >
+                &times;
+              </button>
+              <output
+                class="transcript-search-count"
+                id="transcriptSearchCount"
+                aria-live="polite"
+              ></output>
+              <div
+                class="transcript-search-nav"
+                role="group"
+                aria-label="Search results"
+              >
+                <button
+                  id="transcriptSearchPrevBtn"
+                  type="button"
+                  aria-label="Previous transcript match"
+                  title="Previous match (Shift + Enter)"
+                  disabled
+                >
+                  &#8593;
+                </button>
+                <button
+                  id="transcriptSearchNextBtn"
+                  type="button"
+                  aria-label="Next transcript match"
+                  title="Next match (Enter)"
+                  disabled
+                >
+                  &#8595;
+                </button>
+              </div>
+            </div>
+            <div id="transcriptList"></div>
+          </div>
+        </div>
+
+        <!-- TAB: Overview (chapters + key quotes) - requires LLM -->
+        <div class="tab-panel" data-panel="overview">
+          <!-- Chapters -->
+          <div class="section">
+            <div class="section-title">Chapters</div>
+            <ul class="chapter-list" id="chapterList">
+              <li
+                class="chapter-item"
+                style="
+                  color: var(--text-muted);
+                  cursor: default;
+                  border-color: var(--border);
+                "
+              >
+                Chapters will appear here
+              </li>
+            </ul>
+          </div>
+
+          <!-- Key Quotes -->
+          <div class="section">
+            <div class="section-title">Key Quotes</div>
+            <div id="quotesList">
+              <div
+                class="quote-item"
+                style="
+                  color: var(--text-muted);
+                  border-left-color: var(--border);
+                  cursor: default;
+                "
+              >
+                <div class="quote-text" style="font-style: normal">
+                  Quotes will be extracted when you view this tab...
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB: Notes -->
+        <div class="tab-panel" data-panel="notes">
+          <div class="section">
+            <div class="section-header">
+              <div class="section-title">Saved Notes</div>
+              <div class="notes-filter">
+                <button
+                  class="enhance-btn active"
+                  id="notesFilterThis"
+                  aria-pressed="true"
+                >
+                  This Video
+                </button>
+                <button
+                  class="enhance-btn"
+                  id="notesFilterAll"
+                  aria-pressed="false"
+                >
+                  All Notes
+                </button>
+              </div>
+            </div>
+            <p class="notes-intro">Complete sentences and overall notes. Save individual words and phrases in Vocabulary.</p>
+            <p class="notes-intro" id="notesIntro">
+              Move your mouse over the video and click Note to save a
+              timestamped note, or press the "n" key while the video is focused.
+            </p>
+            <div id="notesList"></div>
+          </div>
+        </div>
+
+        <!-- TAB: Study -->
+        <div class="tab-panel" data-panel="study">
+          <div class="study-journal">
+            <h2 id="studyTitle">Lesson study journal</h2>
+            <p>Understand it, try it, then explain it in your own English.</p>
+            <fieldset><legend>Your learning steps</legend>
+              <label><input id="studyWatched" type="checkbox"> Watched or read the lesson</label>
+              <label><input id="studyExplained" type="checkbox"> Explained the idea without looking</label>
+              <label><input id="studyBuilt" type="checkbox"> Ran a small example and checked the result</label>
+            </fieldset>
+            <label for="studyRecall">Recall in simple English</label>
+            <p>What does this tool do? When would you use it in your RAG or agent project?</p>
+            <textarea id="studyRecall" rows="5" placeholder="Without looking: the main idea is…"></textarea>
+            <label for="studyPractice">Small coding exercise</label>
+            <p>Record your command, observed result, and one failure you fixed.</p>
+            <textarea id="studyPractice" rows="5" placeholder="I changed… I ran… The result was…"></textarea>
+            <label for="studyQuestion">Questions for the next review</label>
+            <textarea id="studyQuestion" rows="4" placeholder="What is still unclear? Which English terms should I review?"></textarea>
+            <div class="study-actions"><button id="studySave" type="button">Save journal</button><button id="studyExport" type="button">Export Markdown</button></div>
+            <p id="studyStatus" role="status">Saved locally per lesson. This does not mark the Academy lesson complete.</p>
+          </div>
+        </div>
+        <!-- TAB: Vocabulary & Phrases -->
+        <div class="tab-panel" data-panel="vocabulary">
+          <div class="section">
+            <div class="section-header">
+              <div>
+                <div class="section-title">Vocabulary &amp; Phrases</div>
+                <p class="vocabulary-subtitle" id="vocabularyScopeDescription">
+                  One card at a time. Use the left and right arrow keys.
+                </p>
+              </div>
+              <span class="vocabulary-count" id="vocabularyCount"></span>
+            </div>
+            <p class="vocabulary-intro" id="vocabularyIntro">
+              Select a word or phrase, then press W or choose Save word.
+            </p>
+            <p id="vocabularyLearnerStatus" class="vocabulary-learner-status"></p>
+            <p id="vocabularyStatus" class="vocabulary-scan-status" role="status" aria-live="polite"></p>
+            <details class="vocabulary-options"><summary>Review options</summary>
+            <div class="vocabulary-controls">
+              <div class="vocabulary-actions" role="group" aria-label="Vocabulary scope">
+                <button id="vocabularyFilterThis" type="button" aria-pressed="true">This Video</button>
+                <button id="vocabularyFilterAll" type="button" aria-pressed="false">All Vocabulary</button>
+              </div>
+              <label><input id="vocabularyAuto" type="checkbox" checked> Auto-collect from transcripts</label>
+              <p>Starts at IELTS 7. Recommendations adapt to words you mark mastered.</p>
+              <div class="vocabulary-actions"><button id="vocabularyScan" type="button">Update recommendations</button><button id="vocabularyExport" type="button">Export notebooks</button></div>
+              <label><input id="vocabularyRecommendedOnly" type="checkbox" checked> Recommended only</label>
+              <div class="vocabulary-actions" role="group" aria-label="Notebook">
+                <button id="vocabularyAllTerms" type="button" aria-pressed="true">Words &amp; Phrases</button>
+                <button id="vocabularyWords" type="button" aria-pressed="false">Words</button>
+                <button id="vocabularyPhrases" type="button" aria-pressed="false">Phrases</button>
+              </div>
+              <input id="vocabularySearch" type="search" placeholder="Search terms or meanings" aria-label="Search notebooks">
+              <label><input id="vocabularyShowMastered" type="checkbox"> Show mastered entries</label>
+            </div>
+            </details>
+            <div class="vocabulary-navigation" role="group" aria-label="Navigate vocabulary">
+              <button id="vocabularyPrevious" type="button" aria-label="Previous word or phrase" aria-keyshortcuts="ArrowLeft" title="Previous (Left arrow)">← Previous</button>
+              <span id="vocabularyPosition" role="status" aria-live="polite">0 / 0</span>
+              <button id="vocabularyNext" type="button" aria-label="Next word or phrase" aria-keyshortcuts="ArrowRight" title="Next (Right arrow)">Next →</button>
+            </div>
+            <div id="vocabularyList" role="region" aria-label="Vocabulary review cards" aria-roledescription="carousel"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Auto-scroll follow button — appears when user scrolls away from playback position -->
+    <button
+      class="follow-playback-btn"
+      id="followPlaybackBtn"
+      style="display: none"
+    >
+      Follow playback
+    </button>
+
+    <script src="settings.js"></script>
+    <script src="vocabulary-context.js"></script>
+    <script src="vocabulary-learning.js"></script>
+    <script src="transcript-export.js"></script>
+    <script src="reader.js"></script>
+    <script src="sidepanel.js"></script>
+    <script src="study.js"></script>
+  </body>
+</html>

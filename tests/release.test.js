@@ -17,7 +17,7 @@ test("manifest uses minimized install-time permissions", () => {
   assert.ok(!manifest.permissions.includes("activeTab"));
   assert.ok(manifest.host_permissions.includes("https://api.deepseek.com/*"));
   assert.equal(Object.hasOwn(manifest, "optional_host_permissions"), false);
-  assert.equal(manifest.version, "1.2.0");
+  assert.equal(manifest.version, "1.2.3");
 });
 
 test("release copy documents current scope without em dashes", () => {
@@ -127,7 +127,7 @@ test("release copy documents current scope without em dashes", () => {
   const optionsScript = read("options.js");
   assert.match(optionsPage, /dash\.supadata\.ai\/auth\/sign-up/i);
   assert.match(optionsPage, /platform\.deepseek\.com\/api_keys/i);
-  assert.doesNotMatch(optionsPage, /<select\b/i);
+  assert.doesNotMatch(optionsPage, /<select[^>]+(?:id|name)="(?:provider|aiModel|aiBaseUrl)"/i);
   assert.doesNotMatch(optionsPage, /id="(?:provider|aiBaseUrl|aiModel)"/);
   const detailsTag = optionsPage.match(
     /<details\b[^>]*class="card customization-card"[^>]*>/,
@@ -203,7 +203,7 @@ test("product UI contains no emoji or emoji-like pictographs", () => {
   assert.doesNotMatch(productUi, /&#(?:9655|9888);/);
 });
 
-test("selection actions use two equal edge-to-edge hover areas", () => {
+test("selection actions use three equal edge-to-edge hover areas", () => {
   const css = read("sidepanel.css");
 
   assert.match(
@@ -212,7 +212,7 @@ test("selection actions use two equal edge-to-edge hover areas", () => {
   );
   assert.match(
     css,
-    /\.explain-btn,\s*\.selection-note-btn\s*\{[^}]*flex:\s*1 1 50%;[^}]*border-radius:\s*0;/,
+    /\.explain-btn,\s*\.selection-note-btn,\s*\.selection-vocabulary-btn\s*\{[^}]*flex:\s*1 1 33\.333%;[^}]*border-radius:\s*0;/,
   );
   assert.match(
     css,
@@ -306,10 +306,8 @@ test("background reconciles side-panel state after navigation commits", () => {
   );
 });
 
-test("retired Remix and reader files are absent", () => {
+test("retired Remix files are absent", () => {
   for (const file of [
-    "reader.html",
-    "reader.js",
     "remix-prompts.js",
     "config.example.js",
   ]) {

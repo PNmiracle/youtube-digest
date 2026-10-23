@@ -9,18 +9,26 @@ Turn every YouTube video into a resource for deep learning. YouTube Digest bring
 - Build understanding with an AI overview, chapters, key quotes, and selected-text explanations.
 - Navigate long videos by clicking timestamps in the transcript, overview, or notes.
 - Save polished timestamped notes for later study.
+- Save selected words or phrases with the `W` shortcut and review them in your notebook.
+- Press `D` on a YouTube watch page to open the Digest panel, or inside the panel to show Transcript.
 - Keep control of your data with your own API keys, local Chrome storage, and no analytics or telemetry.
 
 YouTube Digest is a bring-your-own-key project installed locally from GitHub. It is not available through the Chrome Web Store, does not include API credits, and does not run a developer-operated server.
 
 ![YouTube Digest demo](YouTube%20Digest%20demo.png)
 
-## New in v1.2.0
+## New in v1.2.3
+
+- **Multiple video tabs:** metadata, playback tracking, and relay requests stay bound to the panel’s tab and video. Late replies are discarded immediately when switching tabs.
+
+- **Caption track matching:** reads the selected YouTube track first, preserves precise timestamps, and invalidates cached captions when the track changes. When direct retrieval is unavailable, provider captions are labeled and their language is checked.
+- **Refresh:** reloads the current video’s transcript and resets its translations and overview. Saved notes and words are preserved.
 
 - Search transcript words or phrases and move through every match.
-- Use one Original, Chinese, or bilingual setting across Transcript, Overview, and Notes. New videos stay in Original by default.
+- Use one Original, Chinese, or bilingual setting across Transcript, Overview, and Notes. The panel opens on Transcript in bilingual mode with Follow playback enabled.
 - Translate visible Overview and Notes content progressively in small cached batches.
 - Explain selected transcript text or save it directly as a timestamped note.
+- Save selected vocabulary with its source context for later review.
 - Keep your transcript position across navigation, with the panel closing automatically outside YouTube video pages.
 
 ## Install with your coding agent
@@ -106,13 +114,32 @@ Keys and settings are stored in Chrome's local extension storage on your device.
 5. Select transcript text when you want an AI explanation.
 6. Save a note from the player or a key quote, then revisit it from **Notes**.
 
+Press `[` to play the previous transcript sentence or `]` to play the next one. Press `\` to resume following the current transcript line immediately. These shortcuts work while the YouTube page or Digest side panel has focus, except when you are typing in a field.
+
+Single-language transcripts flow continuously across caption timestamps, keeping complete sentences intact. Click **Timestamps** to show compact timestamped rows when you need playback navigation.
+
+In **Settings → Reading defaults**, choose **Original**, **Chinese only**, or **Original + Chinese** separately for the side panel and Reader, then click **Save reading defaults**. This can be saved before API key setup.
+
+Click **Reader** in the compact top toolbar to open the full-page reading layout. In either the side panel or Reader, press **Option+Q** (Mac) or **Alt+Q** (Windows/Linux) once to enable continuous manual highlighting, then select as many words or phrases as you like. Press the shortcut again or **Esc** to stop. Use **1–5** to choose a color, **H** to highlight a selection, **W** to save vocabulary, and **Undo** or **Cmd/Ctrl+Z** to undo a highlight edit. Vocabulary is never highlighted automatically. During playback, spoken sentences turn gray and the current sentence has a soft gray shadow; unread text keeps its normal color. Your manual highlights save locally per video and become visible when you activate highlighting. Text size and reading width are adjustable. Keep the source video open in another tab for playback.
+
+Use **Option/Alt + = (or +)** to enlarge transcript text, **Option/Alt + −** to shrink it, and **Option/Alt + 0** to reset. Each step is 2px (12–44px). Font sizes are saved separately for the side panel and Reader; shortcuts work while the panel or Reader has focus, outside text fields.
+
+Click **橡皮** (Eraser), then repeatedly select highlighted text to erase it. Partial erasing keeps the rest of a highlight; **Undo** restores it. Click Eraser again or use **Option+Q** to return to the pen, or **Esc** to stop.
+
+Right-click any transcript sentence to jump to its timestamp and start playback in the source video. Normal selection remains available for highlighting.
+
+Use **Export highlights** beside the pen to preview the full original transcript with `[[highlighted words]]`, timestamps, and a vocabulary study prompt appended at the end. **Copy for LLM** copies everything in one step; **Download .txt** saves the same content. The prompt covers meaning in context, English and Chinese explanations, American pronunciation, memory aids, usage examples, and a review quiz. Selection popups and the automatic vocabulary status banner are hidden to leave more space for reading.
+
+Continuous highlighting and locked auto-scroll both start enabled. Turn either switch off whenever you want. Use **Auto On** beside the highlighting switch to follow playback, even after you scroll manually. Visible captions stay still; automatic scrolling happens near the viewport edges, at least four seconds apart. Switch it off to read freely. The bottom toolbar has its own dock outside the scrolling transcript.
+
 ## What works today
 
 - Google Chrome 116 or newer, using the Side Panel API.
 - Standard `youtube.com/watch` video pages.
-- Native subtitle tracks returned by Supadata. YouTube Digest prefers English when available, but may show another native language.
+- The selected YouTube caption track, with validated native Supadata captions as a fallback. Provider captions may differ from the player’s exact track; the transcript source label identifies this fallback.
 - Original, Simplified Chinese, and aligned bilingual transcript views.
 - AI overviews, selected-text explanations, translation, and automatic note polishing.
+- A local vocabulary notebook with saved source context and manual transcript highlighting.
 - Local notes and a local cache for recent transcript and digest results.
 - DeepSeek V4 Flash for all published AI features. Other providers require a local code adaptation and are not supported by this published version.
 
@@ -175,7 +202,7 @@ If you want another AI provider or model, first open the exact YouTube Digest pr
 
 YouTube Digest makes provider requests directly from the extension:
 
-1. It sends a canonical YouTube watch URL to Supadata to request the native transcript.
+1. It tries the selected YouTube caption track directly. If needed, it sends a canonical YouTube watch URL to Supadata for native captions in the selected language (English by default).
 2. It sends the transcript and relevant video metadata to DeepSeek when you request AI features.
 3. Focused features send only the content they need, such as selected text with context or small transcript batches for translation.
 4. It stores keys, settings, notes, and recent cache entries locally in Chrome.
@@ -237,3 +264,15 @@ The agent should also reload the unpacked extension in Chrome and test several r
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### LangChain Academy learning
+
+Open an enrolled lesson at academy.langchain.com and click Open Digest. English captions are read directly from the embedded player; written multimedia lessons use the visible lesson text, labeled separately. Academy content is never sent to Supadata. Overview and optional translation use your configured AI provider.
+
+Use Study to write a simple-English recall, record a small coding exercise and observed result, and save questions for review. Save the journal before switching lessons. Progress is local self-assessment; it does not complete Academy lessons. Export Markdown for your learning portfolio. Transcript, bilingual display, and Follow playback are the defaults.
+
+### English notebooks (IELTS 7.0)
+
+Vocabulary automatically scans loaded transcripts with your configured AI, collecting every distinct word and phrase the AI judges above IELTS 7.0, including difficult academic and technical vocabulary. There is no fixed selection or saved-entry quota. Dense passages are split into smaller requests automatically when output is truncated; previously scanned videos are rescanned under this expanded selection policy on their next open. Collection status is available in the Vocabulary tab; the transcript view stays focused on reading. Mastered terms are excluded from collection, and the notebooks update as each chunk completes. Separate cumulative notebooks retain American IPA, simple English and Chinese explanations, usage tips, original transcript sentences and source timestamps. IPA and explanations are AI generated. Subtitle accuracy depends on the source; IELTS level guides contextual difficulty judgments, not which words you know; AI detection is not guaranteed exhaustive.
+
+Use **Vocabulary → Words / Phrases** to search, mark entries mastered, delete, or export both Markdown notebooks. Manual selection with **W** still works. Disable **Auto-collect from transcripts** to stop future scans; in-flight scans may finish. **Scan / Retry transcript** resumes after failures, skipping successful chunks. Notebooks persist locally across videos without the video cache expiry.

@@ -7,14 +7,39 @@ const vm = require("node:vm");
 const root = path.resolve(__dirname, "..");
 const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
 
+test('Vocabulary alignment rejects invented substrings and unrelated vocabulary IDs',()=>{
+  const {validateVocabularyAlignment}=loadBackgroundHelpers();
+  const rows=[{id:'row',translation:'那么首先，工具调用循环。',entries:[{id:'first'},{id:'loop'}]}];
+  const result=validateVocabularyAlignment({rows:[{id:'row',matches:[{id:'first',text:'首先'},{id:'loop',text:'工具调用循环'},{id:'first',text:'不存在'},{id:'unknown',text:'那么'},{id:'first',text:'首先'}]}]},rows);
+  assert.deepEqual(Array.from(result[0].matches,m=>m.text),['首先','工具调用循环']);
+  assert.equal(validateVocabularyAlignment({rows:{}},rows)[0].matches.length,0);
+});
+
+test('Standalone Descript relay reads metadata and playback without using YouTube APIs',async()=>{
+  const {handleRelayToContent}=loadBackgroundHelpers({tabApi:{get:async()=>({url:'https://share.descript.com/view/demo?transcript=true'}),sendMessage:async()=>{throw new Error('Should use native frame adapter');}},scripting:{executeScript:async options=>[{result:{success:true,videoId:'descript:demo',currentTime:12,title:'Demo'}}]}});
+  for (const action of ['getVideoInfo','getCurrentTime','seekTo']) {
+    const result=await handleRelayToContent({tabId:1,videoId:'descript:demo',payload:{action,seconds:20}});
+    assert.equal(result.success,true);assert.equal(result.response.videoId,'descript:demo');
+  }
+  assert.equal((await handleRelayToContent({tabId:1,videoId:'descript:other',payload:{action:'seekTo',seconds:20}})).success,false);
+});
+
+test('Saved Descript notes link to the source sharing page',async()=>{
+  const {handleSaveNote}=loadBackgroundHelpers();
+  const result=await handleSaveNote('descript:demo',12,'Demo','Descript','Selected words');
+  assert.equal(result.note.timestampedUrl,'https://share.descript.com/view/demo?transcript=true');
+});
+
 function loadSidepanelHelpers({
+  initialStorage = {},
+  reader = false,
   sendMessage = () => Promise.resolve({}),
   setTimeoutImpl = () => 0,
   clearTimeoutImpl = () => {},
 } = {}) {
   const listeners = { addListener() {} };
   const sessionStorage = {};
-  const localStorage = {};
+  const localStorage = initialStorage;
   const sandbox = {
     console,
     URL,
@@ -26,7 +51,7 @@ function loadSidepanelHelpers({
     clearInterval() {},
     IntersectionObserver: class {},
     CSS: { escape: (value) => value },
-    window: { getSelection: () => null, close() {} },
+    window: { digestReader: reader ? {} : undefined, getSelection: () => null, close() {} },
     document: {
       addEventListener() {},
       querySelectorAll: () => [],
@@ -71,6 +96,8 @@ function loadSidepanelHelpers({
 }
 
 function loadBackgroundHelpers({
+  scripting = {},
+  tabApi = {},
   settings = {
     provider: "deepseek",
     aiApiKey: "test-key",
@@ -78,6 +105,7 @@ function loadBackgroundHelpers({
     aiModel: "deepseek-v4-flash",
   },
   fetchImpl = fetch,
+  initialStorage = {},
   setTimeoutImpl = () => 0,
   clearTimeoutImpl = () => {},
   sidePanel = {
@@ -86,7 +114,7 @@ function loadBackgroundHelpers({
   },
 } = {}) {
   const listeners = { addListener() {} };
-  const localStorage = { ytd_settings: settings };
+  const localStorage = { ytd_settings: settings, ...initialStorage };
   const sandbox = {
     console,
     URL,
@@ -125,7 +153,8 @@ function loadBackgroundHelpers({
         getURL: (resourcePath) => `chrome-extension://test/${resourcePath}`,
         sendMessage: () => Promise.resolve({ success: true }),
       },
-      tabs: { onUpdated: listeners, onActivated: listeners },
+      tabs: { onUpdated: listeners, onActivated: listeners, ...tabApi },
+      scripting,
     },
     YTD_SETTINGS: {
       STORAGE_KEY: "ytd_settings",
@@ -136,6 +165,8 @@ function loadBackgroundHelpers({
     },
   };
   sandbox.globalThis = sandbox;
+  vm.runInNewContext(read("academy.js"), sandbox);
+  vm.runInNewContext(read("lesson-highlight-store.js"), sandbox);
   vm.runInNewContext(read("background.js"), sandbox);
   return sandbox.__YTD_TRANSLATION_TESTING__;
 }
@@ -251,13 +282,51 @@ test("the header exposes one universal language control for all result tabs", ()
   assert.doesNotMatch(`${html}\n${js}`, /From video subtitles/);
 });
 
-test("new videos default to Original while returning videos restore their choice", async () => {
-  const { loadDisplayLanguageMode, saveDisplayLanguageMode } =
-    loadSidepanelHelpers();
+test("every video open defaults to bilingual Transcript", async () => {
+  const { loadDisplayLanguageMode } = loadSidepanelHelpers();
 
-  await saveDisplayLanguageMode("video-a", "bilingual");
+  assert.match(read("sidepanel.html"), /class="tab active" data-tab="transcript"/);
+  assert.match(read("sidepanel.html"), /class="tab-panel active" data-panel="transcript"/);
   assert.equal(await loadDisplayLanguageMode("video-a"), "bilingual");
-  assert.equal(await loadDisplayLanguageMode("unseen-video"), "original");
+  assert.equal(await loadDisplayLanguageMode("unseen-video"), "bilingual");
+  assert.doesNotMatch(read("sidepanel.js"), /saveDisplayLanguageMode/);
+  assert.match(
+    read("sidepanel.html"),
+    /data-transcript-mode="bilingual"\s+aria-pressed="true"/,
+  );
+});
+
+test("Chinese fallback cannot be presented as original English captions", () => {
+  const { checkEnglishCaptionResponse } = loadBackgroundHelpers();
+  const chinese = { lang: "zh-CN", content: [{ text: "大家好，今天我们来讨论人工智能记忆系统。" }] };
+  const mislabeled = { lang: "en", content: [{ text: "大家好，今天我们来讨论人工智能记忆系统。" }] };
+  const english = { lang: "en", content: [{ text: "Hello, today we will discuss AI memory systems." }] };
+  assert.equal(checkEnglishCaptionResponse(chinese).error, "ENGLISH_CAPTIONS_UNAVAILABLE");
+  assert.equal(checkEnglishCaptionResponse(mislabeled).error, "ENGLISH_CAPTIONS_UNAVAILABLE");
+  assert.equal(checkEnglishCaptionResponse(english), null);
+});
+
+test("transcript fetch requests English and rejects a Chinese fallback", async () => {
+  let requestUrl;
+  const { handleFetchTranscript } = loadBackgroundHelpers({
+    settings: { supadataApiKey: "test-key" },
+    fetchImpl: async (url) => {
+      requestUrl = new URL(url);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          lang: "zh",
+          content: [{ text: "大家好，今天我们讨论记忆系统。", offset: 0 }],
+        }),
+      };
+    },
+  });
+  const result = await handleFetchTranscript("dQw4w9WgXcQ");
+  assert.equal(requestUrl.searchParams.get("lang"), "en");
+  assert.equal(requestUrl.searchParams.get("mode"), "native");
+  assert.equal(result.error, "ENGLISH_CAPTIONS_UNAVAILABLE");
+  assert.equal(result.transcript, undefined);
 });
 
 test("Overview shares the Transcript batch generation and retries when opened", () => {
@@ -291,13 +360,16 @@ test("transcript reading position survives a side panel close", async () => {
   const { saveTranscriptViewState, loadTranscriptViewState } =
     loadSidepanelHelpers();
 
-  await saveTranscriptViewState("video-a", 427.5);
+  await saveTranscriptViewState("video-a", 427.5, false);
   const restored = await loadTranscriptViewState("video-a");
 
   assert.deepEqual(JSON.parse(JSON.stringify(restored)), {
     videoId: "video-a",
     scrollTop: 427.5,
   });
+
+  await saveTranscriptViewState("video-a", 427.5, true);
+  assert.equal(await loadTranscriptViewState("video-a"), null);
 });
 
 test("selected transcript notes keep exact text and row timestamp", async () => {
@@ -325,6 +397,41 @@ test("selected transcript notes keep exact text and row timestamp", async () => 
     result.note.timestampedUrl,
     "https://www.youtube.com/watch?v=video123&t=92s",
   );
+});
+
+test("notes at different moments in one caption save different sentences", async () => {
+  const transcript = [{
+    start: 630,
+    duration: 20,
+    text: "First, pick up the milk. Then pay at the register. Keep the receipt for later.",
+  }];
+  const { handleSaveNote } = loadBackgroundHelpers({
+    settings: { aiApiKey: "" },
+    initialStorage: { digest_video123: { transcript } },
+    fetchImpl: async () => { throw new Error("cached transcript should be used"); },
+  });
+  const first = await handleSaveNote("video123", 632, "Store", "Speaker");
+  const second = await handleSaveNote("video123", 645, "Store", "Speaker");
+  assert.equal(first.note.text,
+    "First, pick up the milk. Context: Then pay at the register. Keep the receipt for later.");
+  assert.equal(second.note.text,
+    "Keep the receipt for later. Context: First, pick up the milk. Then pay at the register.");
+  assert.equal(first.note.rawText, "First, pick up the milk.");
+  assert.equal(second.note.rawText, "Keep the receipt for later.");
+  assert.notEqual(first.note.text, second.note.text);
+});
+
+test("previous notes with repeated cleanup text display their distinct source", async () => {
+  const repeated = "An identical expanded note.";
+  const { handleGetNotes } = loadBackgroundHelpers({
+    initialStorage: { ytd_notes: [
+      { videoId: "video123", text: repeated, rawText: "First spoken sentence." },
+      { videoId: "video123", text: repeated, rawText: "Second spoken sentence." },
+    ] },
+  });
+  const result = await handleGetNotes("video123");
+  assert.equal(result.notes[0].text, "First spoken sentence.");
+  assert.equal(result.notes[1].text, "Second spoken sentence.");
 });
 
 test("semantic segmentation rebuilds sentences across caption boundaries", () => {
@@ -355,7 +462,7 @@ test("a huge raw Supadata entry is split into seekable bounded segments", () => 
     { start: 12, duration: 90, text },
   ]);
   assert.ok(segments.length > 8);
-  assert.ok(segments.every((segment) => segment.text.length <= 384));
+  assert.ok(segments.every((segment) => segment.text.length <= 160));
   assert.equal(segments[0].start, 12);
   assert.ok(segments.at(-1).start > segments[0].start);
   assert.ok(segments.every((segment) => /^segment-\d+-\d+$/.test(segment.id)));
@@ -374,6 +481,46 @@ test("Chinese sentence and clause punctuation creates semantic guardrails", () =
   assert.equal(segments.length, 2);
   assert.equal(segments[0].text, "这是一个被字幕切开的完整句子。");
   assert.equal(segments[1].text, "这是第二个想法，也应该保持语义完整！");
+});
+
+test("unpunctuated captions stay short without dropping or reordering words", () => {
+  const { groupTranscriptEntries } = loadSidepanelHelpers();
+  const entries = Array.from({ length: 12 }, (_, index) => ({
+    start: 355 + index * 2,
+    duration: 2,
+    text: `these are the spoken words from caption ${index}`,
+  }));
+  const segments = groupTranscriptEntries(entries);
+  assert.ok(segments.length >= 4);
+  assert.ok(segments.every(segment => segment.text.length <= 160));
+  assert.equal(segments.map(segment => segment.text).join(" "),
+    entries.map(entry => entry.text).join(" "));
+  segments.forEach(segment => {
+    const lastIndex = Number(segment.text.match(/caption (\d+)/g).at(-1).split(" ")[1]);
+    assert.ok(entries[lastIndex].start + 2 - segment.start <= 8);
+  });
+});
+
+test("one long caption splits by time even when its text fits the character limit", () => {
+  const { groupTranscriptEntries } = loadSidepanelHelpers();
+  const text = "had these lovely comments coming through some stories that were told to my mom and we find the book so helpful";
+  const segments = groupTranscriptEntries([{ start: 355, duration: 24, text }]);
+  assert.ok(segments.length >= 3);
+  assert.equal(segments.map(segment => segment.text).join(" "), text);
+  segments.forEach(segment => {
+    assert.ok(segment.text.length / text.length * 24 <= 8);
+  });
+  assert.equal(segments[0].start, 355);
+  assert.ok(segments.at(-1).start > 370);
+});
+
+test("translation cache follows the exact text after transcript regrouping", () => {
+  const { transcriptTranslationCacheKey } = loadSidepanelHelpers();
+  const original = { id: "segment-0-355000", text: "A long original paragraph." };
+  const shorter = { ...original, text: "A long" };
+  assert.notEqual(transcriptTranslationCacheKey(original),
+    transcriptTranslationCacheKey(shorter));
+  assert.match(transcriptTranslationCacheKey(shorter), /semantic-v2:/);
 });
 
 test("structured translation batches align by stable ID and expose missing fallback", () => {
@@ -509,7 +656,7 @@ test("all AI product requests use DeepSeek non-thinking and JSON behavior", asyn
   const backgroundSource = read("background.js");
   assert.equal(
     (backgroundSource.match(/await requestAiCompletion\(\{/g) || []).length,
-    4,
+    5,
   );
   assert.doesNotMatch(backgroundSource, /disableThinking/);
   for (const callPath of [
@@ -517,6 +664,7 @@ test("all AI product requests use DeepSeek non-thinking and JSON behavior", asyn
     "cleanupNoteText",
     "handleExplainSelection",
     "callAiTranslation",
+    "handleExtractVocabulary",
   ]) {
     assert.match(
       backgroundSource,
@@ -577,6 +725,21 @@ test("provider idle silence aborts with a distinct Retry-able error", async () =
   assert.equal(result.code, "AI_IDLE_TIMEOUT");
   assert.match(result.error, /inactive for 50 seconds.*Retry/i);
   assert.equal(timers.activeCount(120_000), 0);
+});
+
+test("provider network failures explain likely DNS or filtering causes", async () => {
+  const helpers = loadBackgroundHelpers({
+    fetchImpl: async () => {
+      throw new TypeError("Failed to fetch");
+    },
+  });
+
+  const result = await helpers.callAiTranslation("Translate.", "Hello.");
+  assert.equal(result.success, false);
+  assert.equal(result.code, "AI_NETWORK_ERROR");
+  assert.match(result.error, /securely connect to DeepSeek/i);
+  assert.match(result.error, /DNS filter, VPN, firewall, proxy/i);
+  assert.doesNotMatch(result.error, /^Failed to fetch$/i);
 });
 
 test("blank-line keepalives cannot evade the provider hard cap", async () => {
@@ -780,4 +943,141 @@ test("Chinese prompt preserves natural bilingual-learning style rules", () => {
   assert.match(prompt, /Use 你, never 您/);
   assert.match(prompt, /spaces between Chinese and adjacent English words or digits/);
   assert.match(prompt, /source-language `text`/);
+});
+
+
+test("provider rejects wrong and mixed languages", () => {
+  const { checkEnglishCaptionResponse, checkCaptionResponse } = loadBackgroundHelpers();
+  assert.equal(checkEnglishCaptionResponse({ lang: "es", content: [{ text: "Hola" }] }).error, "ENGLISH_CAPTIONS_UNAVAILABLE");
+  assert.equal(checkEnglishCaptionResponse({ lang: "en", content: [{ text: "Bonjour", lang: "fr" }] }).error, "ENGLISH_CAPTIONS_UNAVAILABLE");
+  assert.equal(checkCaptionResponse({ lang: "fr-FR", content: [{ text: "Bonjour", lang: "fr" }] }, "fr"), null);
+});
+
+test("player captions preserve subsecond timing and skip non-caption events", () => {
+  const { parsePlayerTranscript } = loadBackgroundHelpers();
+  const result = parsePlayerTranscript({ videoId: "AAAAAAAAAAA", key: "track", source: "youtube-player", language: "en", data: { events: [
+    { tStartMs: 0 },
+    { tStartMs: 1250, dDurationMs: 1750, segs: [{ utf8: "Hello " }, { utf8: "world\n" }] },
+  ] } });
+  assert.equal(result.transcript.length, 1);
+  assert.equal(result.transcript[0].start, 1.25);
+  assert.equal(result.transcript[0].duration, 1.75);
+  assert.equal(result.transcriptText, "Hello world");
+  assert.equal(result.sourceKey, "track");
+  assert.equal(parsePlayerTranscript({ data: { events: [] } }), null);
+});
+
+test("native fetch selects the active ASR track and rejects stale identity", async () => {
+  let expectedVideo = "AAAAAAAAAAA";
+  let requestedKind;
+  const tracks = [
+    { vssId: ".en", languageCode: "en", baseUrl: "https://www.youtube.com/api/timedtext?kind=manual" },
+    { vssId: "a.en", languageCode: "en", kind: "asr", baseUrl: "https://www.youtube.com/api/timedtext?kind=asr" },
+  ];
+  const { readPlayerCaptions } = loadBackgroundHelpers({ scripting: {
+    executeScript: async ({ func, args }) => {
+      const context = vm.createContext({ URL, AbortController, setTimeout: () => 1, clearTimeout() {},
+        document: { getElementById: () => ({
+          getPlayerResponse: () => ({ videoDetails: { videoId: expectedVideo }, captions: { playerCaptionsTracklistRenderer: { captionTracks: tracks } } }),
+          getOption: () => ({ vss_id: "a.en", languageCode: "en", kind: "asr" }),
+        }) },
+        fetch: async (url) => { requestedKind = new URL(url).searchParams.get("kind"); return { ok: true, json: async () => ({ events: [{ tStartMs: 1250, segs: [{ utf8: "Correct track" }] }] }) }; },
+      });
+      return [{ result: await vm.runInContext(`(${func.toString()})(...${JSON.stringify(args)})`, context) }];
+    },
+  } });
+  const track = await readPlayerCaptions(1, "AAAAAAAAAAA");
+  assert.match(track.key, /a.en:asr/);
+  const result = await readPlayerCaptions(1, "AAAAAAAAAAA", true, track.key);
+  assert.equal(requestedKind, "asr");
+  assert.ok(result.data.events.length);
+  assert.equal((await readPlayerCaptions(1, "AAAAAAAAAAA", true, "wrong-track")).error, "CAPTION_TRACK_CHANGED");
+  expectedVideo = "BBBBBBBBBBB";
+  assert.equal(await readPlayerCaptions(1, "AAAAAAAAAAA"), null);
+});
+
+
+test("relay stays on the named tab even when another YouTube tab is active", async () => {
+  const sent = [];
+  const { handleRelayToContent } = loadBackgroundHelpers({ tabApi: {
+    get: async (id) => ({ id, url: "https://www.youtube.com/watch?v=AAAAAAAAAAA" }),
+    query: async () => { throw new Error("must not choose another tab"); },
+    sendMessage: async (id, payload) => { sent.push({ id, payload }); return { videoId: "AAAAAAAAAAA", currentTime: 12 }; },
+  } });
+  const result = await handleRelayToContent({ tabId: 101, videoId: "AAAAAAAAAAA", payload: { action: "getCurrentTime" } });
+  assert.equal(result.success, true);
+  assert.equal(result.tabId, 101);
+  assert.equal(sent[0].id, 101);
+  assert.equal(sent[0].payload.videoId, "AAAAAAAAAAA");
+  assert.equal((await handleRelayToContent({ payload: { action: "getCurrentTime" } })).success, false);
+});
+
+test("relay rejects navigation during a pending reply without trying another tab", async () => {
+  let url = "https://www.youtube.com/watch?v=AAAAAAAAAAA";
+  let sends = 0;
+  const { handleRelayToContent } = loadBackgroundHelpers({ tabApi: {
+    get: async () => ({ url }),
+    query: async () => { throw new Error("no fallback allowed"); },
+    sendMessage: async () => { sends++; url = "https://www.youtube.com/watch?v=BBBBBBBBBBB"; return { videoId: "AAAAAAAAAAA", currentTime: 8 }; },
+  } });
+  assert.equal((await handleRelayToContent({ tabId: 101, videoId: "AAAAAAAAAAA", payload: { action: "getCurrentTime" } })).success, false);
+  assert.equal(sends, 1);
+  assert.equal((await handleRelayToContent({ tabId: 101, videoId: "AAAAAAAAAAA", payload: { action: "getCurrentTime" } })).success, false);
+  assert.equal(sends, 1);
+});
+
+test("canonical player metadata retains video identity", async () => {
+  const { handleRelayToContent } = loadBackgroundHelpers({ tabApi: {
+    get: async () => ({ url: "https://www.youtube.com/watch?v=AAAAAAAAAAA" }),
+    sendMessage: async () => ({ videoId: "AAAAAAAAAAA", title: "DOM title" }),
+  }, scripting: { executeScript: async () => [{ result: { videoId: "AAAAAAAAAAA", title: "Player title" } }] } });
+  const result = await handleRelayToContent({ tabId: 101, videoId: "AAAAAAAAAAA", payload: { action: "getVideoInfo" } });
+  assert.equal(result.response.videoId, "AAAAAAAAAAA");
+  assert.equal(result.response.title, "Player title");
+});
+
+
+test("panel and Reader honor saved language defaults on every video open", async () => {
+  const initialStorage = { ytd_settings: { defaultTranscriptMode: "zh", defaultReaderMode: "original" } };
+  const panel = loadSidepanelHelpers({ initialStorage });
+  const reader = loadSidepanelHelpers({ initialStorage, reader: true });
+  assert.equal(await panel.loadDisplayLanguageMode("first-video"), "zh");
+  assert.equal(await reader.loadDisplayLanguageMode("first-video"), "original");
+  initialStorage.ytd_settings.defaultTranscriptMode = "original";
+  initialStorage.ytd_settings.defaultReaderMode = "bilingual";
+  assert.equal(await panel.loadDisplayLanguageMode("another-video"), "original");
+  assert.equal(await reader.loadDisplayLanguageMode("another-video"), "bilingual");
+  initialStorage.ytd_settings.defaultTranscriptMode = "invalid";
+  initialStorage.ytd_settings.defaultReaderMode = "invalid";
+  assert.equal(await panel.loadDisplayLanguageMode("another-video"), "bilingual");
+  assert.equal(await reader.loadDisplayLanguageMode("another-video"), "original");
+});
+
+test('the Li Lu sentence stays intact across the 3:58 and 4:04 captions', () => {
+  const { groupTranscriptEntries } = loadSidepanelHelpers();
+  const first = 'So, today I want to dedicate an episode to describing how Li Lu views the issue of China’s middle-income trap and how he';
+  const last = 'analyzes the problem of how China can overcome it.';
+  const next = 'First, as everyone knows, since 2021 the economic situation in China over the last few years has not been particularly good.';
+  const segments = groupTranscriptEntries([
+    { start: 238, duration: 6, text: first },
+    { start: 244, duration: 4, text: last },
+    { start: 248, duration: 7, text: next },
+  ]);
+  assert.equal(segments.length, 2);
+  assert.equal(segments[0].text, `${first} ${last}`);
+  assert.ok(segments[0].text.length > 160);
+  assert.equal(segments[0].start, 238);
+  assert.equal(segments[1].text, next);
+  assert.equal(segments.map(segment => segment.text).join(' '), `${first} ${last} ${next}`);
+});
+
+test('complete long sentences keep every word even beyond the old time and length limits', () => {
+  const { groupTranscriptEntries } = loadSidepanelHelpers();
+  const text = Array.from({ length: 100 }, (_, index) => `word${index}`).join(' ') + '.';
+  const segments = groupTranscriptEntries([{ start: 10, duration: 45, text }]);
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0].text, text);
+  assert.equal(segments[0].start, 10);
+  const chinese = '这是一段需要完整保留的中文句子'.repeat(20) + '。';
+  assert.equal(groupTranscriptEntries([{ start: 0, duration: 40, text: chinese }])[0].text, chinese);
 });

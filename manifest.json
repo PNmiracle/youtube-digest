@@ -1,14 +1,23 @@
 {
   "manifest_version": 3,
   "name": "YouTube Digest",
-  "version": "1.2.0",
+  "version": "1.2.3",
   "minimum_chrome_version": "116",
   "description": "Turn YouTube videos into learning resources with transcripts, bilingual translation, AI overviews, and notes.",
-  "permissions": ["sidePanel", "storage", "tabs", "scripting"],
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "tabs",
+    "scripting"
+  ],
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://api.supadata.ai/*",
-    "https://api.deepseek.com/*"
+    "https://api.deepseek.com/*",
+    "https://academy.langchain.com/*",
+    "https://langchain-ai.github.io/lca-lessons/*",
+    "https://share.descript.com/embed/*",
+    "https://share.descript.com/view/*"
   ],
   "action": {
     "default_title": "Open YouTube Digest",
@@ -30,8 +39,32 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://www.youtube.com/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://academy.langchain.com/*",
+        "https://share.descript.com/view/*",
+        "https://share.descript.com/embed/*"
+      ],
+      "js": [
+        "academy-content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://share.descript.com/view/*"
+      ],
+      "js": [
+        "descript-native.js"
+      ],
       "run_at": "document_idle"
     }
   ],

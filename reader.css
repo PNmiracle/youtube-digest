@@ -1,0 +1,54 @@
+/* Wide, quiet transcript canvas inspired by the supplied reader reference. */
+:root { --reader-size:28px; --reader-width:1180px; --bg:#fff; --text:#333; --text-secondary:#333; }
+body { background:#fff; }
+.header { padding:14px 32px 0; background:#fff; }
+.header-top, .tabs { width:min(var(--reader-width), 100%); margin-inline:auto; }
+.video-info { max-width:65%; }
+.content { padding:28px 64px 150px; }
+#resultsState { width:min(var(--reader-width), 100%); margin:auto; }
+.section { background:transparent; border:0; padding:0; box-shadow:none; }
+.transcript-vocabulary-summary { display:none; }
+.transcript-entry { padding:5px 0; gap:24px; margin:0; border-radius:0; }
+.transcript-entry:hover, .transcript-entry.active-playback { background:transparent; box-shadow:none; }
+.transcript-replay-btn { min-width:56px; padding-top:10px; }
+.transcript-time { font:13px/1.6 var(--font-body); color:#777; }
+.transcript-replay-icon { opacity:.45; }
+.transcript-text, .transcript-original, .transcript-entry > .transcript-text { font-size:var(--reader-size); font-weight:400; line-height:1.7; color:#333; }
+.transcript-text { flex:1; min-width:0; }
+.transcript-translation { font-size:.78em; color:#777; font-weight:400; }
+mark.vocabulary-highlight, mark.user-highlight { font-weight:inherit; }
+mark.vocabulary-highlight { background:#f1ede5; box-shadow:none; }
+@media(max-width:700px) {
+  .header { padding:10px 14px 0; }
+  .content { padding:20px 16px 170px; }
+  .transcript-entry { gap:8px; }
+}
+
+/* Book layout: sentence anchors remain in the DOM, while prose flows across them. */
+:root { --reader-width:960px; }
+#transcriptList { font:400 var(--reader-size)/1.85 var(--font-reading); color:#333; }
+.reader-paragraph { margin:0; }
+.reader-paragraph .transcript-entry { display:inline; padding:0; margin:0; }
+.reader-paragraph .transcript-replay-btn { display:none; }
+.reader-paragraph .transcript-text,
+.reader-paragraph .transcript-original { display:inline; font-size:inherit; line-height:inherit; font-weight:400; }
+.reader-paragraph .transcript-translation { display:block; margin:.3em 0 .65em; padding:0; border:0; font-size:.78em; }
+.reader-paragraph .transcript-entry.search-current { box-shadow:none; background:#fff7df; }
+
+#transcriptList .reader-paragraph .transcript-entry { display:inline; padding:0; margin:0; }
+#transcriptList .reader-paragraph .transcript-replay-btn { display:none; }
+#transcriptList .reader-paragraph .transcript-text,
+#transcriptList .reader-paragraph .transcript-original { line-height:inherit; }
+
+#toggleTranscriptTimestampsBtn { display:none; }
+#transcriptList.continuous-reading { font-size:var(--reader-size); line-height:1.85; }
+
+/* Match the compact panel toolbar while preserving the wide reading canvas. */
+.header { padding:8px 20px 0; }
+.header-top .video-info { flex:1 1 200px; max-width:100%; }
+.header-top .header-actions { flex:0 1 auto; }
+.content { padding-top:12px; }
+@media(max-width:700px) {
+  .header { padding:8px 12px 0; }
+  .header-top .header-actions { flex:1 1 100%; }
+}

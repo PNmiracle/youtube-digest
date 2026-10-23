@@ -7,6 +7,8 @@
 var YTD_SETTINGS = (() => {
   const STORAGE_KEY = "ytd_settings";
   const DEFAULTS = Object.freeze({
+    defaultTranscriptMode: "bilingual",
+    defaultReaderMode: "original",
     provider: "deepseek",
     aiApiKey: "",
     aiBaseUrl: "https://api.deepseek.com",
@@ -20,6 +22,10 @@ var YTD_SETTINGS = (() => {
 
   function normalize(input = {}) {
     return {
+      defaultTranscriptMode: ["original", "zh", "bilingual"].includes(input.defaultTranscriptMode)
+        ? input.defaultTranscriptMode : DEFAULTS.defaultTranscriptMode,
+      defaultReaderMode: ["original", "zh", "bilingual"].includes(input.defaultReaderMode)
+        ? input.defaultReaderMode : DEFAULTS.defaultReaderMode,
       provider: DEFAULTS.provider,
       aiApiKey: isLegacyCustom(input)
         ? ""

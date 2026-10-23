@@ -24,7 +24,7 @@ const debugLog = (...args) => {
 
 let ytdNoteButton = null;
 let ytdNoteButtonTimer = null;
-let ytdNoteKeyboardListenerAdded = false;
+let ytdKeyboardListenerAdded = false;
 let ytdNoteButtonRetryTimer = null;
 let ytdDigestButton = null;
 let digestButtonObserver = null;
@@ -40,10 +40,10 @@ let digestButtonResizeListenerAdded = false;
  * We wait a bit for YouTube's UI to fully render.
  */
 function init() {
-  // Register the global "n" keyboard shortcut once
-  if (!ytdNoteKeyboardListenerAdded) {
-    document.addEventListener("keydown", handleNoteKeyboardShortcut);
-    ytdNoteKeyboardListenerAdded = true;
+  // Register the video-page keyboard shortcuts once.
+  if (!ytdKeyboardListenerAdded) {
+    document.addEventListener("keydown", handleKeyboardShortcut);
+    ytdKeyboardListenerAdded = true;
   }
 
   // Try to inject the buttons immediately
@@ -142,13 +142,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Return the current video playback time (used by auto-scroll)
     const video = document.querySelector("video.html5-main-video");
     sendResponse({
-      currentTime: video ? Math.floor(video.currentTime) : 0,
+      currentTime: video ? video.currentTime : 0,
       paused: video ? video.paused : true,
+      videoId: new URLSearchParams(window.location.search).get("v"),
     });
     return false;
   }
 
+  if (message.action === "togglePlayback") {
+    const video = document.querySelector("video.html5-main-video");
+    if (!video) {
+      sendResponse({ success: false, error: "Video player not found" });
+      return false;
+    }
+    if (video.paused) {
+      Promise.resolve(video.play()).catch((error) =>
+        console.error("[YouTube Digest] Play error:", error),
+      );
+    } else {
+      video.pause();
+    }
+    sendResponse({ success: true });
+    return false;
+  }
+
   if (message.action === "seekTo") {
+    if (
+      message.videoId &&
+      message.videoId !== new URLSearchParams(window.location.search).get("v")
+    ) {
+      sendResponse({ success: false, error: "Video changed" });
+      return false;
+    }
     // Jump the video to a specific timestamp
     debugLog("[YouTube Digest Content] Seeking to:", message.seconds);
     seekToTimestamp(message.seconds);
@@ -162,6 +187,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ success: true });
     return false;
   }
+
+  // This command is handled by the side panel, which owns the transcript.
+  if (message.action === "navigateSentence") return false;
+  if (message.action === "followPlayback") return false;
 
   // Unknown action - still send a response to prevent hanging
   debugLog("[YouTube Digest Content] Unknown action:", message.action);
@@ -535,13 +564,18 @@ function resetNoteButtonTimer() {
 }
 
 /**
- * Handles the "n" keyboard shortcut for saving a note.
+ * Handles N, D, sentence navigation, and following on YouTube watch pages.
  * Only triggers on YouTube watch pages and when the user is not typing
  * in an input field.
  */
-function handleNoteKeyboardShortcut(e) {
+function handleKeyboardShortcut(e) {
   if (!window.location.pathname.includes("/watch")) return;
-  if (e.key !== "n" && e.key !== "N") return;
+  const key = e.key?.toLocaleLowerCase();
+  if (
+    key !== "n" && key !== "d" && key !== "[" &&
+    key !== "]" && key !== "\\"
+  ) return;
+  if (e.repeat || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
 
   // Ignore if the user is typing in an input/textarea/contenteditable
   const active = document.activeElement;
@@ -549,14 +583,51 @@ function handleNoteKeyboardShortcut(e) {
     active &&
     (active.tagName === "INPUT" ||
       active.tagName === "TEXTAREA" ||
-      active.isContentEditable)
+      active.tagName === "SELECT" ||
+      active.isContentEditable ||
+      active.getAttribute?.("role") === "textbox" ||
+      e.target?.closest?.("[contenteditable], [role='textbox']"))
   ) {
     return;
   }
 
-  // Prevent YouTube's own "n" shortcut (e.g. next video in playlist)
+  // Keep YouTube from handling the same letter after our shortcut.
   e.preventDefault();
   e.stopPropagation();
+
+  if (key === "[" || key === "]") {
+    chrome.runtime
+      .sendMessage({
+        action: "navigateSentence",
+        direction: key === "[" ? "previous" : "next",
+        videoId: new URLSearchParams(window.location.search).get("v"),
+      })
+      .catch((error) =>
+        console.error("[YouTube Digest] Sentence shortcut error:", error),
+      );
+    return;
+  }
+
+  if (key === "\\") {
+    chrome.runtime
+      .sendMessage({
+        action: "followPlayback",
+        videoId: new URLSearchParams(window.location.search).get("v"),
+      })
+      .catch((error) =>
+        console.error("[YouTube Digest] Follow shortcut error:", error),
+      );
+    return;
+  }
+
+  if (key === "d") {
+    chrome.runtime
+      .sendMessage({ action: "openSidePanel" })
+      .catch((error) =>
+        console.error("[YouTube Digest] Open side panel error:", error),
+      );
+    return;
+  }
 
   // Show brief visual feedback on the button, then save
   showNoteButton();
@@ -576,8 +647,7 @@ async function saveCurrentNote() {
     return;
   }
 
-  // Go back 3 seconds to capture what was just said (user reacts after hearing it)
-  const currentTime = Math.max(0, Math.floor(video.currentTime) - 3);
+  const currentTime = Math.max(0, Math.floor(video.currentTime));
   const videoInfo = extractVideoInfo();
   const videoId = new URLSearchParams(window.location.search).get("v");
 
@@ -725,6 +795,7 @@ function extractVideoInfo() {
   );
 
   return {
+    videoId: new URLSearchParams(window.location.search).get("v"),
     title: titleElement?.textContent?.trim() || "",
     channelName: channelElement?.textContent?.trim() || "",
     duration: videoElement?.duration || 0,

@@ -104,6 +104,7 @@ function createHarness() {
   const windowListeners = {};
   const observers = [];
   const timers = new Map();
+  const runtimeMessages = [];
   let nextTimerId = 1;
 
   const document = {
@@ -137,9 +138,10 @@ function createHarness() {
 
   const context = vm.createContext({
     console,
+    URLSearchParams,
     document,
     window: {
-      location: { pathname: "/watch" },
+      location: { pathname: "/watch", search: "?v=video-a" },
       addEventListener(type, listener) {
         windowListeners[type] = listener;
       },
@@ -153,7 +155,8 @@ function createHarness() {
     chrome: {
       runtime: {
         onMessage: { addListener() {} },
-        async sendMessage() {
+        async sendMessage(message) {
+          runtimeMessages.push(message);
           return { success: true };
         },
       },
@@ -189,6 +192,7 @@ function createHarness() {
     documentListeners,
     windowListeners,
     observers,
+    runtimeMessages,
     flushTimers() {
       const callbacks = Array.from(timers.values());
       timers.clear();
@@ -196,6 +200,63 @@ function createHarness() {
     },
   };
 }
+
+test("D opens the Digest panel and ignores editable fields", async () => {
+  const harness = createHarness();
+  const event = {
+    key: "d",
+    preventDefault() {},
+    stopPropagation() {},
+  };
+
+  harness.context.handleKeyboardShortcut(event);
+  await Promise.resolve();
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.runtimeMessages)), [
+    { action: "openSidePanel" },
+  ]);
+
+  harness.context.handleKeyboardShortcut({ ...event, key: "D" });
+  await Promise.resolve();
+  assert.equal(harness.runtimeMessages.length, 2);
+
+  harness.context.document.activeElement = { tagName: "INPUT" };
+  harness.context.handleKeyboardShortcut(event);
+  await Promise.resolve();
+  assert.equal(harness.runtimeMessages.length, 2);
+
+  harness.context.document.activeElement = null;
+  harness.context.handleKeyboardShortcut({ ...event, metaKey: true });
+  await Promise.resolve();
+  assert.equal(harness.runtimeMessages.length, 2);
+});
+
+test("brackets navigate sentences and backslash resumes following on the video page", async () => {
+  const harness = createHarness();
+  let prevented = 0;
+  const event = {
+    key: "[",
+    target: {},
+    preventDefault() { prevented += 1; },
+    stopPropagation() {},
+  };
+
+  harness.context.handleKeyboardShortcut(event);
+  harness.context.handleKeyboardShortcut({ ...event, key: "]" });
+  harness.context.handleKeyboardShortcut({ ...event, key: "\\" });
+  await Promise.resolve();
+  assert.equal(prevented, 3);
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.runtimeMessages)), [
+    { action: "navigateSentence", direction: "previous", videoId: "video-a" },
+    { action: "navigateSentence", direction: "next", videoId: "video-a" },
+    { action: "followPlayback", videoId: "video-a" },
+  ]);
+
+  harness.context.document.activeElement = { tagName: "INPUT" };
+  harness.context.handleKeyboardShortcut(event);
+  harness.context.document.activeElement = null;
+  harness.context.handleKeyboardShortcut({ ...event, metaKey: true });
+  assert.equal(harness.runtimeMessages.length, 3);
+});
 
 function createActionRow({ width, height }) {
   const row = new FakeElement({

@@ -15,14 +15,23 @@ Depending on the feature you use, YouTube Digest handles:
 - transcript context around a timestamped note;
 - content you ask to translate;
 - notes you save;
+- vocabulary entries and their source context;
 - Supadata and DeepSeek configuration, including API keys; and
 - cached transcript, digest, and translation results.
 
 ## Where data goes
 
+### YouTube
+
+The extension reads the active player’s selected caption track and retrieves its timestamped captions directly from YouTube.
+
+### LangChain Academy multimedia lessons
+
+The extension reads Academy lesson pages and public written lessons under `https://langchain-ai.github.io/lca-lessons/`. For videos nested inside those lessons, it reads native English caption cues and playback time from the matching Descript player. It also supports standalone Descript video sharing pages. Descript access is limited to `https://share.descript.com/embed/` and `https://share.descript.com/view/` URLs; it does not include Descript account or editing pages. When embedded video captions are unavailable, Digest uses the written lesson content.
+
 ### Supadata
 
-YouTube Digest sends the canonical YouTube video URL to `https://api.supadata.ai` with your Supadata API key. Supadata returns the transcript and timestamps. A Supadata key is required for transcript retrieval.
+YouTube Digest sends the canonical YouTube video URL to `https://api.supadata.ai` with your Supadata API key. Supadata returns the transcript and timestamps. Supadata is used as a fallback when the player caption track cannot be retrieved directly. The requested language follows the selected track when available.
 
 ### DeepSeek
 
@@ -46,6 +55,7 @@ YouTube Digest uses Chrome's local extension storage, not a YouTube Digest cloud
 
 - Supadata and DeepSeek settings and API keys remain on the device in Chrome's extension storage.
 - Saved notes remain until you delete them or remove/clear the extension's data. The extension keeps up to 100 notes.
+- Vocabulary entries remain until you delete them or remove/clear the extension's data.
 - Recent transcript, digest, and per-segment translation cache entries are stored
   locally. The cache is limited to 20 videos, and entries older than 30 days are
   removed when the side panel opens.
@@ -55,6 +65,7 @@ Chrome extension storage is not a password vault. Anyone with sufficient access 
 To remove data:
 
 - delete individual saved notes in YouTube Digest;
+- delete individual vocabulary entries in YouTube Digest;
 - use the Options page to clear cached digests, delete all notes, or reset all extension data;
 - remove the extension or clear its stored data from Chrome to delete all local settings, keys, notes, and cache entries; and
 - revoke keys in the Supadata or DeepSeek dashboard to stop their future use.
@@ -66,7 +77,7 @@ Clearing local data does not delete information already processed or retained by
 YouTube Digest uses Chrome permissions for these purposes:
 
 - `sidePanel`: display the YouTube Digest interface beside YouTube.
-- `storage`: store settings, keys, notes, and cached results locally.
+- `storage`: store settings, keys, notes, vocabulary, and cached results locally.
 - `tabs`: identify and interact with the active YouTube tab.
 - `scripting`: coordinate the extension's YouTube page controls.
 - YouTube host access: read the active video's URL and metadata and provide timestamp controls.
@@ -86,3 +97,13 @@ Privacy-relevant changes will be documented in this file and in the repository h
 ## Questions
 
 This repository does not provide a public support or issue channel. Review this policy, the source code, and each provider's documentation before using the extension. For a vulnerability or accidental secret exposure, follow the private process in [SECURITY.md](SECURITY.md).
+
+### LangChain Academy
+
+The extension reads English captions from the player or visible text from the enrolled lesson you open. It does not collect your Academy password or session cookies, and Academy lesson content is never sent to Supadata. Overview, explanation, and optional translation send relevant lesson text to the configured AI provider. Study journal text and self-assessed progress remain in local extension storage unless you export them.
+
+### Automatic English vocabulary collection
+
+Auto-collect is enabled by default. Loaded transcript text is sent in chunks to the AI provider configured in Settings to suggest words and phrases for IELTS 7.0. Entries, American IPA, bilingual explanations, source sentences, timestamps, mastery status and scan progress are stored locally in Chrome. Vocabulary controls let you disable collection, delete entries and export notebooks. Disabling collection stops future scans; in-flight requests may finish.
+
+Academy lesson text highlights store selected text, nearby text used to restore the selection, its lesson source URL, color, and creation time in local Chrome extension storage. These highlights are not sent to an AI service or to Web Highlights.
