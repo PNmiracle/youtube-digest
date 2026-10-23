@@ -2034,6 +2034,7 @@ async function openHighlightExport() {
     };
     const text = DigestTranscriptExport.build({
       title: currentVideoTitle,
+      language: currentTranscriptLanguage || "en",
       url: currentVideoUrl || `https://youtube.com/watch?v=${videoId}`,
       segments: getActiveTranscriptSegments().map(segment => ({
         start: segment.start,
@@ -3204,6 +3205,10 @@ async function autoCollectVocabulary(manual = false) {
     return;
   }
   if (!currentVideoId || !currentTranscript?.length) { if (manual) setVocabularyCollectionStatus("Load an English transcript first."); return; }
+  if (/^fr(?:-|$)/i.test(currentTranscriptLanguage || "")) {
+    setVocabularyCollectionStatus("French transcript loaded. Highlight words and use Export highlights for French vocabulary study.");
+    return;
+  }
   const segments = groupTranscriptEntries(currentTranscript).map(({ text, start }) => ({ text, start }));
   const id = currentVideoId;
   const signature = `${id}:${transcriptSignature(JSON.stringify(segments))}:${transcriptSignature(JSON.stringify(YTD_VOCABULARY_LEARNING.profile(currentVocabulary)))}`;

@@ -4,7 +4,7 @@
     const value = Math.max(0, Math.floor(Number(seconds) || 0));
     return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, '0')}`;
   };
-  function build({ title, url, segments = [], highlights = [] }) {
+  function build({ title, url, language = "en", segments = [], highlights = [] }) {
     const rows = segments.map(segment => ({ ...segment, ranges: { original: [], translation: [] } }));
     const targets = [], unmatched = [];
     for (const item of highlights) {
@@ -55,7 +55,7 @@ Help me understand and remember every highlighted word and phrase in the transcr
 For each highlighted word or phrase:
 1. Quote its original sentence and timestamp. Use nearby transcript lines to reconstruct a complete sentence when needed, without inventing wording.
 2. Explain what it means in this specific sentence: give a simple, natural English explanation and a concise Chinese explanation or translation. Include its part of speech or grammatical role. Explain idioms, phrasal verbs, and fixed expressions as a whole.
-3. Teach pronunciation: give American English IPA, mark the stressed syllable, and provide an easy pronunciation guide. For phrases, mention useful linking or reduced sounds when relevant.
+3. Teach pronunciation: ${/^fr(?:-|$)/i.test(language) ? "give French IPA and an easy pronunciation guide. Explain relevant nasal vowels, silent letters, liaison, and elision; include noun gender and a useful verb form when applicable." : "give American English IPA, mark the stressed syllable, and provide an easy pronunciation guide. For phrases, mention useful linking or reduced sounds when relevant."}
 4. Help me memorize it with one concrete memory cue, mental image, or association connected to this sentence. Do not invent word origins; label imaginative associations as memory aids.
 5. Show how to use it: give one common collocation and one short, natural everyday example with a Chinese translation. Briefly flag a common mistake or confusing similar word only when useful.
 

@@ -764,12 +764,20 @@ async function readPlayerCaptions(tabId, videoId, fetchContent = false, sourceKe
         if (response?.videoDetails?.videoId !== expectedVideoId) return null;
         const tracks = response?.captions?.playerCaptionsTracklistRenderer?.captionTracks || [];
         const selected = player.getOption?.("captions", "track");
-        const track = tracks.find((item) => (selected?.vssId || selected?.vss_id) && item.vssId === (selected.vssId || selected.vss_id))
+        // YouTube's automatic captions identify the spoken source language.
+        // With manual-only captions, the first source track is our fallback.
+        const sourceLanguage = (tracks.find(item => item.kind === "asr") || tracks[0])?.languageCode;
+        const frenchSource = /^fr(?:-|$)/i.test(sourceLanguage || "");
+        const frenchTrack = frenchSource && (tracks.find(item => /^fr(?:-|$)/i.test(item.languageCode) && item.kind !== "asr")
+          || tracks.find(item => /^fr(?:-|$)/i.test(item.languageCode)));
+        const track = frenchTrack
+          || tracks.find((item) => (selected?.vssId || selected?.vss_id) && item.vssId === (selected.vssId || selected.vss_id))
           || tracks.find((item) => selected?.languageCode && item.languageCode === selected.languageCode && item.kind === selected.kind)
           || tracks.find((item) => /^en(?:-|$)/i.test(item.languageCode) && item.kind !== "asr")
-          || tracks.find((item) => /^en(?:-|$)/i.test(item.languageCode));
+          || tracks.find((item) => /^en(?:-|$)/i.test(item.languageCode))
+          || tracks[0];
         if (!track?.baseUrl) return null;
-        const translatedLanguage = selected?.translationLanguage?.languageCode;
+        const translatedLanguage = frenchTrack ? null : selected?.translationLanguage?.languageCode;
         const language = translatedLanguage || track.languageCode;
         const key = `${expectedVideoId}:${track.vssId || track.languageCode}:${track.kind || "manual"}:${translatedLanguage || ""}`;
         const descriptor = { videoId: expectedVideoId, key, language, source: "youtube-player" };

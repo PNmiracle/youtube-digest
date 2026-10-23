@@ -128,6 +128,8 @@ Click **橡皮** (Eraser), then repeatedly select highlighted text to erase it. 
 
 Right-click any transcript sentence to jump to its timestamp and start playback in the source video. Normal selection remains available for highlighting.
 
+French videos are supported in the same extension: when the player's native caption metadata identifies French, Digest prefers French source captions, including over translated English captions. If direct fetching fails, the provider is asked for native French and a different-language fallback is rejected. Use **Original** for French text or **双语** for French with Chinese translation. French highlight exports request French IPA and pronunciation guidance. The automatic vocabulary notebook remains English-only; use highlight export to study French vocabulary.
+
 Use **Export highlights** beside the pen to preview the full original transcript with `[[highlighted words]]`, timestamps, and a vocabulary study prompt appended at the end. **Copy for LLM** copies everything in one step; **Download .txt** saves the same content. The prompt covers meaning in context, English and Chinese explanations, American pronunciation, memory aids, usage examples, and a review quiz. Selection popups and the automatic vocabulary status banner are hidden to leave more space for reading.
 
 Continuous highlighting and locked auto-scroll both start enabled. Turn either switch off whenever you want. Use **Auto On** beside the highlighting switch to follow playback, even after you scroll manually. Visible captions stay still; automatic scrolling happens near the viewport edges, at least four seconds apart. Switch it off to read freely. The bottom toolbar has its own dock outside the scrolling transcript.

@@ -249,7 +249,7 @@ for file in "${javascript_files[@]}"; do
 done
 
 if compgen -G "tests/*.test.js" >/dev/null; then
-  node --test tests/*.test.js
+  node --test tests/*.test.js >&2
 fi
 
 if ((${#javascript_files[@]} > 0)); then

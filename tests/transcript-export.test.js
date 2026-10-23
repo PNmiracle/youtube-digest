@@ -33,3 +33,10 @@ test('no highlights exports readable full transcript with an explicit empty stat
   assert.match(make([]), /No highlights matched/);
   assert.match(make([]), /\[0:04\] More context\./);
 });
+test('French export teaches French pronunciation rather than American English IPA', () => {
+  const text=build({language:'fr-CA',segments:[{start:0,original:'Bonjour.'}],highlights:[{start:0,lane:'original',from:0,to:7,quote:'Bonjour'}]});
+  assert.match(text,/French IPA/);
+  assert.match(text,/liaison/);
+  assert.doesNotMatch(text,/American English IPA/);
+  assert.ok(text.indexOf('VOCABULARY STUDY REQUEST')>text.indexOf('END OF TRANSCRIPT'));
+});

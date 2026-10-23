@@ -1081,3 +1081,59 @@ test('complete long sentences keep every word even beyond the old time and lengt
   const chinese = '这是一段需要完整保留的中文句子'.repeat(20) + '。';
   assert.equal(groupTranscriptEntries([{ start: 0, duration: 40, text: chinese }])[0].text, chinese);
 });
+
+function frenchCaptionFixture({ tracks, selected = {}, nativeAvailable = true, providerLanguage = 'fr' }) {
+  let requestedUrl, providerUrl;
+  const { readPlayerCaptions, handleFetchTranscript } = loadBackgroundHelpers({
+    settings: { supadataApiKey: 'test-key' },
+    fetchImpl: async url => { providerUrl = new URL(url); return {ok:true,status:200,json:async()=>({lang:providerLanguage,content:[{text:'Bonjour tout le monde.',offset:1250,duration:2000,lang:providerLanguage}]})}; },
+    scripting: {executeScript: async ({func,args}) => {
+      const context = vm.createContext({URL,AbortController,setTimeout:()=>1,clearTimeout(){},
+        document:{getElementById:()=>({
+          getPlayerResponse:()=>({videoDetails:{videoId:'AAAAAAAAAAA'},captions:{playerCaptionsTracklistRenderer:{captionTracks:tracks}}}),
+          getOption:()=>selected,
+        })},
+        fetch:async url=>{requestedUrl=new URL(url);return {ok:nativeAvailable,json:async()=>({events:[{tStartMs:1250,dDurationMs:2000,segs:[{utf8:'Bonjour tout le monde.'}]}]})};},
+      });
+      return [{result:await vm.runInContext(`(${func.toString()})(...${JSON.stringify(args)})`,context)}];
+    }},
+  });
+  return {readPlayerCaptions,handleFetchTranscript,requested:()=>requestedUrl,provider:()=>providerUrl};
+}
+const frenchTrack = {vssId:'a.fr',languageCode:'fr',kind:'asr',baseUrl:'https://www.youtube.com/api/timedtext?lang=fr'};
+const englishTrack = {vssId:'.en',languageCode:'en',baseUrl:'https://www.youtube.com/api/timedtext?lang=en'};
+test('French source loads French captions even with English subtitles or auto-translation selected', async()=>{
+  for (const selected of [{}, {vssId:'.en',languageCode:'en'}, {vssId:'a.fr',translationLanguage:{languageCode:'en'}}]) {
+    const f=frenchCaptionFixture({tracks:[englishTrack,frenchTrack],selected});
+    const result=await f.handleFetchTranscript('AAAAAAAAAAA',1);
+    assert.equal(result.language,'fr');
+    assert.equal(result.transcript[0].text,'Bonjour tout le monde.');
+    assert.equal(f.requested().searchParams.get('lang'),'fr');
+    assert.equal(f.requested().searchParams.has('tlang'),false);
+  }
+});
+test('French source prefers manual French captions and supports regional French',async()=>{
+  const manual={...frenchTrack,vssId:'.fr-CA',languageCode:'fr-CA',kind:undefined};
+  const f=frenchCaptionFixture({tracks:[englishTrack,frenchTrack,manual]});
+  const descriptor=await f.readPlayerCaptions(1,'AAAAAAAAAAA');
+  assert.equal(descriptor.language,'fr-CA');
+  assert.match(descriptor.key,/\.fr-CA/);
+});
+test('manual-only French video works without an active caption selection',async()=>{
+  const f=frenchCaptionFixture({tracks:[{...frenchTrack,kind:undefined,vssId:'.fr'}]});
+  assert.equal((await f.readPlayerCaptions(1,'AAAAAAAAAAA')).language,'fr');
+});
+test('French provider fallback requests native French and rejects an English fallback',async()=>{
+  for (const providerLanguage of ['fr','en']) {
+    const f=frenchCaptionFixture({tracks:[frenchTrack],nativeAvailable:false,providerLanguage});
+    const result=await f.handleFetchTranscript('AAAAAAAAAAA',1);
+    assert.equal(f.provider().searchParams.get('lang'),'fr');
+    assert.equal(f.provider().searchParams.get('mode'),'native');
+    if(providerLanguage==='fr') {assert.equal(result.success,true);assert.equal(result.language,'fr');}
+    else {assert.equal(result.error,'CAPTION_LANGUAGE_MISMATCH');assert.equal(result.transcript,undefined);}
+  }
+});
+test('English source retains English captions when French is an available translation',async()=>{
+  const f=frenchCaptionFixture({tracks:[{...englishTrack,kind:'asr',vssId:'a.en'},{...frenchTrack,kind:undefined,vssId:'.fr'}]});
+  assert.equal((await f.readPlayerCaptions(1,'AAAAAAAAAAA')).language,'en');
+});
